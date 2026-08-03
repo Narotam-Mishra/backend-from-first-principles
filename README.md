@@ -3,8 +3,6 @@
 
 ## 01. Roadmap for backend from first principles (31:23)
 
-# Backend Engineering Roadmap - Simplified Summary
-
 ## 🎯 What This Course Covers
 
 Backend engineering is **much more than just building CRUD APIs**. It's about creating:
