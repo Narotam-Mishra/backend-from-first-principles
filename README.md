@@ -899,10 +899,6 @@ app.get('/large-file', (req, res) => {
 
 ## 06. What is Routing in Backend? How Requests Find Their Way Home (24:03)
 
-Here is a detailed, simple summary of the **Routing** transcript. I have broken down every concept (Static, Dynamic, Query Params, Nested, Versioning, and Catch-All) with clear definitions, important pointers, and basic code examples (using Express.js syntax, as it’s the most readable for demonstrating routing logic).
-
----
-
 ### 🧭 The Core Idea of Routing
 Routing is the **"Where"** of a request.
 
@@ -1065,5 +1061,176 @@ app.post('*', (req, res) => {
 5. **Nested Routes** (`/users/:id/posts/:postId`) express **relationships** between resources.
 6. **Versioning** (`/v1/` vs `/v2/`) is crucial for handling **breaking changes** without crashing older apps.
 7. **Catch-All (`*`)** routes must be placed **at the very end** to gracefully handle `404 Not Found` errors.
+
+---
+
+## 07. Serialization and Deserialization for backend engineers (21:47)
+
+### 🧠 The Core Problem (Why do we need this?)
+Imagine you have a **JavaScript Frontend** (Browser) and a **Rust Backend** (Server).
+
+- JavaScript is dynamic, untyped, and runs in a browser.
+- Rust is compiled, strictly typed, and runs on a server.
+
+If the JavaScript app creates an object (`{ name: "John" }`) and sends it "as-is" over the network, the Rust server won't understand it because memory allocation, data types, and storage formats are completely different between these two languages. 
+
+**The Solution**: Both sides must agree on a **Common Standard Format** (a "middleman" language) to transmit data.
+
+---
+
+### 1. Core Definitions
+- **Serialization**: The process of converting a **native data structure** (like a JavaScript Object or a Rust Struct) into a **standard, transmittable format** (like a JSON string) so it can be sent over the network.
+- **Deserialization**: The reverse process. Converting that **standard format** (JSON string) back into a **native data structure** that the receiving machine can understand and process.
+
+> **💡 Key Pointer:** It is **language-agnostic**. Serialization/Deserialization allows a JavaScript client to talk to a Rust, Python, Go, or Java server seamlessly.
+
+---
+
+### 2. The OSI Model Mental Model (What you need to know)
+The transcript mentions the OSI model (7 layers of networking). 
+
+- The **Physical/Network layers** (bits, packets, frames) are handled by network engineers.
+- **Backend Engineers** only care about the **Application Layer** (Layer 7).
+- **Mental Model**: Simply imagine that the client converts data to **JSON String** ➔ sends it ➔ the server receives the **JSON String** and converts it. Ignore the 1s and 0s traveling through fiber optics; that is not your responsibility.
+
+---
+
+### 3. Types of Serialization Formats
+
+| Category | Examples | Characteristics |
+| :--- | :--- | :--- |
+| **Text-Based** | **JSON**, XML, YAML | **Human-readable**, easy to debug, but larger in size and slower to parse. (JSON is used ~80% of the time for REST APIs). |
+| **Binary-Based** | **Protocol Buffers (Protobuf)**, Avro | **Machine-readable** (binary), very fast, smaller size, but not readable by humans. Used for high-performance internal microservices or gRPC. |
+
+> **💡 Key Pointer:** For this series (and most standard web development), we focus on **JSON** because it is the default standard for HTTP/REST APIs.
+
+---
+
+### 4. Deep Dive into JSON (JavaScript Object Notation)
+Despite the name, JSON is **not limited to JavaScript**. Every language has libraries to parse it.
+
+**The Rules of JSON:**
+
+1. Starts with `{` (curly brace) and ends with `}`.
+2. **Keys** MUST be inside **double quotes** (`"key"`). Single quotes are invalid in strict JSON.
+3. **Values** can be: `String` (double quotes), `Number`, `Boolean` (`true/false`), `Array` (`[]`), or another `Object` (`{}`).
+4. It is **human-readable**, making debugging easy.
+
+**Raw JSON Example (The "Common Standard" String):**
+```json
+{
+  "id": 1,
+  "name": "JavaScript Mastery",
+  "author": "Jane Doe",
+  "isPublished": true,
+  "tags": ["backend", "api"]
+}
+```
+
+---
+
+### 5. The Complete Flow (Step-by-Step with Code)
+
+#### Step 1: Client (JavaScript) Serializes the Data
+The frontend takes a JavaScript object and converts it into a JSON **string** to send over the network.
+
+```javascript
+// 1. Frontend Native Object (JavaScript)
+const book = {
+  id: 1,
+  title: "My Book",
+  author: "John"
+};
+
+// 2. SERIALIZATION: Convert native object -> JSON String
+const jsonString = JSON.stringify(book);
+console.log(jsonString); 
+// Output: '{"id":1,"title":"My Book","author":"John"}'
+
+// 3. Send this string in the HTTP request body
+fetch('/api/books', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: jsonString // The serialized data goes here!
+});
+```
+
+#### Step 2: Server (Node.js/Python/Rust) Deserializes the Request
+The server receives the raw JSON string and converts it back into its native format (e.g., a Rust Struct or JS Object) so it can access the fields easily.
+
+```javascript
+// Backend (Node.js - Express example)
+app.post('/api/books', (req, res) => {
+  // 4. DESERIALIZATION: The middleware (express.json()) automatically 
+  //    reads the JSON string from the body and converts it to a JS object.
+  const bookObject = req.body; 
+  
+  // Now the server can access it like a normal object!
+  console.log(bookObject.title); // Output: "My Book"
+  console.log(bookObject.author); // Output: "John"
+
+  // 5. Process logic... (save to database)
+  // 6. SERIALIZATION (Response): The server converts its response back to JSON string.
+  res.json({ status: "Book saved!" }); // This automatically serializes the object to JSON string.
+});
+```
+
+#### Step 3: Client Receives and Deserializes the Response
+The client receives the response string and converts it back to a JavaScript object.
+
+```javascript
+fetch('/api/books', { method: 'POST', body: jsonString })
+  .then(response => response.json()) // 7. DESERIALIZATION: Parses JSON string -> JS Object
+  .then(data => {
+    console.log(data.status); // The client can now use the data!
+  });
+```
+
+---
+
+### 6. Advanced Concept: Text-Based vs Binary-Based (Code Comparison)
+
+Although we use JSON for simplicity, understanding *why* Protobuf exists is important.
+
+**Text-Based (JSON)**:
+```http
+POST /user HTTP/1.1
+Content-Type: application/json
+
+{"name": "Alice", "age": 30}   <-- 100% Human Readable (Easy to debug)
+```
+
+**Binary-Based (Protobuf - simulated)**:
+```text
+0x0A 0x05 0x41 0x6C 0x69 0x63 0x65 0x10 0x1E 
+```
+*(Just a bunch of bytes - not readable, but much smaller to transfer and faster to decode).*
+
+> **💡 Key Pointer:** Use **JSON** for public REST APIs (browsers expect it). Use **Protobuf** for internal microservice communication (when you need extreme speed and low bandwidth).
+
+---
+
+### 7. Common Pitfalls & Errors to Watch Out For
+
+| Issue | Why it happens | How to fix |
+| :--- | :--- | :--- |
+| **Missing or Extra Fields** | The server expects a field, but the client forgot it (or vice versa). | Use **Schema Validation** on the backend to check if required fields exist before processing. |
+| **Null Values** | A field is missing or set to `null`. | Handle null checks in your code (`if (user.age === null) ...`). |
+| **Date/Time Issues** | JSON doesn't have a native Date type. Usually sent as a string (`"2026-08-06T10:00:00Z"`). | Ensure both client and server agree on the ISO-8601 format. |
+| **Data Type Mismatch** | Client sends `"age": "30"` (String), but server expects `age: 30` (Number). | Use type validators (like Zod in JS or `serde` in Rust) to cast types during deserialization. |
+| **Unescaped Characters** | Sending raw binary data in JSON can break the string. | Use Base64 encoding for binary images/files if sending via JSON (or use `multipart/form-data` for large files). |
+
+---
+
+### 🏁 Final Summary of Key Pointers
+1. **Serialization** = Native Object ➔ Common Standard String (e.g., `JSON.stringify()`).
+2. **Deserialization** = Common Standard String ➔ Native Object (e.g., `JSON.parse()` or `response.json()`).
+3. **Why?** To allow machines running completely different languages to communicate over the internet.
+4. **Backend Focus**: Only care about the "Application Layer" (the JSON). Network stuff (TCP/IP, packets) is not your concern.
+5. **JSON Rules**: Keys **must** be in double quotes. Values can be strings, numbers, booleans, arrays, or nested objects.
+6. **Text vs Binary**: Use JSON for readability (browsers). Use Protobuf for performance (internal services).
+7. **Validate on the Server**: Never trust client input. Always validate and sanitize data during deserialization.
+
+---
 
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
