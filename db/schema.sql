@@ -267,4 +267,5 @@ ALTER TABLE ONLY public.user_profiles
 --
 
 INSERT INTO public.schema_migrations (version) VALUES
-    ('20260904153448');
+    ('20260904153448'),
+    ('20260904182904');
