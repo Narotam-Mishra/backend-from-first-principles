@@ -1,2 +1,21 @@
 
+# Operating-system and editor files
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# Local database data and backups
+postgres-data/
+*.sql.bak
+*.dump
