@@ -2709,4 +2709,213 @@ FROM inserted_users;
 
 ## 013. Caching, the secret behind it all (01:04:22)
 
+## 🧠 The Core Idea (Simple Definition)
+
+**Caching** is a mechanism to **decrease the time and effort** it takes to perform a task. 
+
+Technically, it means storing a **subset of your primary data** (the frequently used pieces) in a **location that is much faster to access** than the original source (like a disk-based database). 
+
+**Analogy:** Think of your phone's contact list. Instead of going to the city hall's massive database to find your mom's phone number every single time, you save her number in your phone's local memory. That's caching—fast, local, and convenient.
+
+---
+
+## 🌍 Real-World Examples (Why Caching is EVERYWHERE)
+
+| Platform | The Problem | How Caching Solves It |
+| :--- | :--- | :--- |
+| **Google Search** | Searching "weather today" involves expensive algorithms crawling billions of pages. | Caches the search results for popular queries. If someone searches it again, Google serves the cached result instantly instead of re-running the heavy computation. |
+| **Netflix** | Streaming 4K videos to millions globally from one US server would cause massive buffering. | Uses **CDN (Content Delivery Networks)**. Caches movies on "Edge Servers" located physically close to users (e.g., India, Europe). You watch the movie from the server next door, not the one across the ocean. |
+| **Twitter (X)** | Calculating "Trending Topics" involves analyzing millions of tweets in real-time (heavy GPU/CPU work). | Calculates the trends every few minutes and caches the result. When millions of users open the trending tab, they read the cached data instead of triggering a new heavy calculation. |
+
+> **💡 Key Pointer:** Caching is used in two major scenarios: **1) Avoiding heavy computation** (Google/Twitter) and **2) Avoiding transferring heavy data** (Netflix/CDN).
+
+---
+
+## 🏛️ The 3 Levels of Caching
+
+### 1. Network Level Caching
+- **CDN (Content Delivery Network)**: Caches static assets (images, videos, HTML, CSS) on edge servers close to the user.
+  - *Flow:* User requests file → DNS routes to nearest "Point of Presence (PoP)" → Edge server checks cache → **Hit** (serve) or **Miss** (fetch from Origin server, store, then serve).
+- **DNS Caching**: Converting `google.com` to an IP address is expensive (involves Root servers, TLD servers, etc.). 
+  - *Layers of DNS Cache:* **Browser Cache** → **OS Cache** → **ISP/Recursive Resolver Cache**. This prevents your computer from asking the global DNS network for the same domain every millisecond.
+
+### 2. Hardware Level Caching (CPU)
+- **L1, L2, L3 Caches**: Super-fast memory located directly on the CPU chip.
+- **RAM (Main Memory)**: Faster than Hard Drives/SSDs but volatile (data resets on power off) and expensive. Disk storage is persistent but slow.
+
+### 3. Software Level Caching (Backend Engineer's Focus)
+This is where **Redis** and **Memcached** come in.
+- **In-Memory Databases**: They store data in **RAM** instead of on a Disk.
+- **Why RAM?** Accessing RAM takes nanoseconds; accessing a Disk takes milliseconds. RAM is **~100,000x faster**.
+- **Trade-off**: RAM is expensive and volatile. Redis uses RAM for speed but has mechanisms to periodically save to disk for persistence.
+
+---
+
+## 🔑 Caching Strategies (How to Read and Write)
+
+### Strategy 1: Lazy Caching (Cache-Aside) - *Read Heavy*
+*You only put data in the cache when someone actually asks for it.*
+
+1.  Client requests data.
+2.  Check Cache → **Miss** (not found).
+3.  Fetch data from Primary Database (slow).
+4.  Store the result in the Cache.
+5.  Return data to client.
+6.  Next request → **Hit** (found in cache) → Return instantly.
+
+**Best for:** Read-heavy applications where data doesn't change often (Product details, user profiles).
+
+### Strategy 2: Write-Through Caching - *Write Heavy*
+*You update the Database and the Cache simultaneously during a write operation.*
+
+1.  Client updates data (PUT/POST).
+2.  Update the Primary Database.
+3.  Update the Cache with the new data.
+4.  Return success to client.
+
+**Pros:** Cache is always fresh (zero stale data).
+**Cons:** Write operations are slower because you have to write to two places.
+
+---
+
+## 🗑️ Eviction Policies (What to delete when Cache is full?)
+
+Since RAM is limited, the cache cannot hold everything. We use policies to decide what to throw out when the cache is full.
+
+| Policy | How it works | Analogy |
+| :--- | :--- | :--- |
+| **LRU (Least Recently Used)** | Removes the item that hasn't been accessed for the longest time. | You clear out books from your desk that you haven't touched in weeks. |
+| **LFU (Least Frequently Used)** | Removes the item that has been accessed the fewest times overall. | You keep your go-to dictionary (frequent) and throw away the random brochure you looked at once. |
+| **TTL (Time To Live)** | Removes items after a specific time (e.g., 60 seconds). | You throw away yesterday's newspaper because it's outdated. |
+| **No Eviction** | Returns an error when the memory is full (doesn't delete anything). | Your table is full; you refuse to put anything else on it until you manually clear space. |
+
+---
+
+## 🛠️ 4 Major Backend Use Cases (With Code Examples)
+
+### Use Case 1: Database Query Caching (Heavy Computations)
+Imagine a dashboard that runs a heavy SQL query joining 5 tables. Instead of running the query every time a user refreshes, we cache the result.
+
+**Example (Node.js with Redis):**
+```javascript
+const redis = require('redis');
+const client = redis.createClient();
+
+async function getDashboardData(userId) {
+  const cacheKey = `dashboard:${userId}`;
+  
+  // 1. Try to get from Cache
+  const cachedData = await client.get(cacheKey);
+  if (cachedData) {
+    console.log('✅ Cache Hit! Returning fast data.');
+    return JSON.parse(cachedData);
+  }
+
+  // 2. Cache Miss → Fetch from DB (Expensive operation)
+  console.log('🔄 Cache Miss. Querying heavy SQL...');
+  const dbResult = await db.query(`
+    SELECT * FROM orders 
+    JOIN products ON orders.product_id = products.id 
+    WHERE user_id = $1
+  `, [userId]);
+
+  // 3. Store in Cache with TTL (expires in 60 seconds)
+  await client.setEx(cacheKey, 60, JSON.stringify(dbResult));
+  return dbResult;
+}
+```
+
+### Use Case 2: Session Storage (Authentication)
+Storing user sessions in Redis instead of a SQL DB makes login checks lightning-fast.
+
+**Example:**
+```javascript
+// User logs in
+app.post('/login', async (req, res) => {
+  const user = await authenticate(req.body);
+  const sessionId = generateSessionId();
+
+  // Store session data in Redis (not in PostgreSQL)
+  // Key: session:123abc, Value: { userId: 1, role: 'admin' }
+  await redis.setEx(`session:${sessionId}`, 3600, JSON.stringify(user)); // 1 hour TTL
+  res.cookie('session_id', sessionId);
+});
+
+// Middleware to verify requests
+async function authMiddleware(req, res, next) {
+  const sessionId = req.cookies.session_id;
+  const userData = await redis.get(`session:${sessionId}`);
+  if (!userData) return res.status(401).send('Unauthorized');
+  
+  req.user = JSON.parse(userData); // Fast RAM lookup!
+  next();
+}
+```
+
+### Use Case 3: API Caching (Reducing External API Calls)
+If you call a 3rd party API (e.g., Weather API) that charges per request, caching saves money.
+
+**Example:**
+```javascript
+async function getWeather(city) {
+  const cacheKey = `weather:${city}`;
+  const cached = await redis.get(cacheKey);
+  
+  if (cached) {
+    return JSON.parse(cached); // Save $0.01 per request!
+  }
+
+  // Expensive external call
+  const data = await fetch(`https://api.weather.com/current?city=${city}`);
+  await redis.setEx(cacheKey, 1800, JSON.stringify(data)); // Cache for 30 mins
+  return data;
+}
+```
+
+### Use Case 4: Rate Limiting (Preventing Spam/Abuse)
+Instead of counting requests in your PostgreSQL DB (which would flood it), use Redis to count them.
+
+**Example (Rate Limit Middleware):**
+```javascript
+async function rateLimiter(req, res, next) {
+  const ip = req.headers['x-forwarded-for'];
+  const key = `rate_limit:${ip}`;
+  
+  // INCR (Increment) the counter for this IP
+  const currentCount = await redis.incr(key);
+  
+  // If first request, set TTL to 60 seconds
+  if (currentCount === 1) {
+    await redis.expire(key, 60);
+  }
+
+  // Max 50 requests per minute
+  if (currentCount > 50) {
+    return res.status(429).json({ error: 'Too Many Requests' });
+  }
+  next();
+}
+```
+
+---
+
+## 🏁 Final Summary of Key Pointers
+
+1.  **Caching = Speed + Reduced Load**. It avoids repeating expensive work.
+2.  **Network Caches**: CDNs and DNS caching bring data geographically closer to you.
+3.  **In-Memory Databases (Redis)**: Store data in RAM. They are **~100,000x faster** than disk-based databases, but RAM is expensive and volatile.
+4.  **Cache-Aside (Lazy)**: Read from DB on a **Miss**, then cache it. Best for reads.
+5.  **Write-Through**: Update DB and Cache together. Best for writes (ensures freshness).
+6.  **Eviction Policies**: Use **LRU** (least recently used) or **TTL** (time to live) to manage limited RAM space.
+7.  **Real-world Backend Uses**:
+    - Cache heavy SQL query results (Dashboard data).
+    - Store user sessions (Automatic logins).
+    - Cache 3rd party API responses (Weather, Payment webhooks).
+    - Store rate-limit counters (Prevent bots without killing the DB).
+8.  **Rule of thumb**: Cache data that is **read frequently** but **updated infrequently** (product details, user profiles, static assets).
+
+---
+
+## 014. Task queues and background jobs (55:46)
+
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
