@@ -6549,4 +6549,5 @@ exports.handler = async (event) => {
 
 ## 022. Concurrency & Parallelism: IO Bound vs CPU Bound (1:28:05)
 
+
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
