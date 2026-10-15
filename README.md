@@ -6549,5 +6549,358 @@ exports.handler = async (event) => {
 
 ## 022. Concurrency & Parallelism: IO Bound vs CPU Bound (1:28:05)
 
+Here is a comprehensive, simplified summary of the **Concurrency & Parallelism** transcript. This covers why concurrency matters, IO vs CPU bound operations, concurrency vs parallelism, threading model, event loop model, virtual threads/goroutines, async/await mechanics, and race conditions—complete with practical code examples.
+
+---
+
+## 🧠 Why Concurrency Matters
+
+Every backend server needs to handle **multiple requests at once**. If it could only handle one request at a time, all other users would have to wait—which is impossible in production.
+
+> **💡 Key Point:** This video isn't about techniques. It's about building a **mental model** of how your server processes multiple requests and performs multiple tasks.
+
+---
+
+## ⏱️ The Cost of Not Using Concurrency
+
+**Scenario:** A server makes a database query and waits for the response.
+
+| Location | Wait Time |
+| :--- | :--- |
+| Local network | ~1-2ms |
+| Different availability zone | ~20-30ms |
+| Different region | ~90-100ms |
+
+**During this wait time, what is the CPU doing?** Nothing. It's **idle**.
+
+**The Math:**
+- A modern CPU executes ~3 billion instructions per second = 3 million per millisecond.
+- If the server waits 100ms for a DB response, it could have executed **300 million instructions**.
+- Instead, it executed **0**.
+
+**Real-World API Call:**
+- 5 network operations (DB queries, Redis, external API) × 50ms each = **250ms waiting for IO**.
+- CPU processing time: only **10ms**.
+- **Result:** CPU and memory are idle **95% of the time**.
+
+---
+
+## 🔄 IO Bound vs CPU Bound Operations
+
+| Type | Definition | Examples | Optimization |
+| :--- | :--- | :--- | :--- |
+| **IO Bound** | Waiting for external resources (network, disk, etc.) | DB queries, API calls, file reads, logging | **Concurrency** |
+| **CPU Bound** | Actual computation using CPU cycles | Validation, JSON parsing, encryption, image processing | **Parallelism** |
+
+> **💡 Key Point:** Most backend applications are **IO bound** (70%+ of time is waiting for IO). Concurrency is mandatory for IO bound workloads.
+
+---
+
+## 🆚 Concurrency vs Parallelism
+
+| Aspect | Concurrency | Parallelism |
+| :--- | :--- | :--- |
+| **Definition** | Dealing with multiple things at once | Doing multiple things at once |
+| **Hardware** | Works with 1 CPU core | Requires 2+ CPU cores |
+| **Focus** | Program structure (start, pause, resume) | Simultaneous execution |
+| **Best For** | IO bound tasks | CPU bound tasks |
+
+**Visualization (1 CPU Core - Concurrency):**
+```
+Time:    1ms    5ms    15ms   40ms   50ms   60ms
+Req A:   [CPU]──[Wait for DB]──────[CPU]──[Done]
+Req B:          [CPU]──────[Wait for DB]──[CPU]──[Done]
+```
+Only one request uses the CPU at any moment, but both are "in progress."
+
+**Visualization (2 CPU Cores - Parallelism):**
+```
+Time:    1ms    5ms    15ms   40ms   50ms   60ms
+Req A:   [CPU Core 1]──────────────────────────[Done]
+Req B:   [CPU Core 2]──────────────────────────[Done]
+```
+Both requests execute simultaneously on different cores.
+
+---
+
+## 🧵 Threading Model (OS-Level Threads)
+
+**What is a Thread?** An independent piece of execution managed by the operating system.
+
+**What the OS creates per thread:**
+1. **Stack:** For function calls and local variables.
+2. **Instruction Pointer:** Tracks where execution is in the code.
+3. **Scheduler Entry:** Managed by OS scheduler.
+
+**How it works:**
+- Each thread gets a **time slice** (e.g., 2ms) on the CPU.
+- When a thread blocks on IO, the OS scheduler switches to another thread.
+- This is called **preemptive scheduling**.
+
+**Code Example (Python Threading):**
+```python
+import threading
+
+def handle_request(request_id):
+    # CPU work
+    print(f"Processing request {request_id}")
+    # IO work (blocking)
+    result = db.query("SELECT * FROM users")  # Thread blocks here
+    # CPU work
+    return result
+
+# Create a thread per request
+thread = threading.Thread(target=handle_request, args=(1,))
+thread.start()
+```
+
+**Problems with Threads:**
+
+| Problem | Description |
+| :--- | :--- |
+| **Memory Overhead** | Each thread gets ~8MB stack (virtual). 10,000 threads = ~8GB+ memory. |
+| **Creation Overhead** | System call to OS kernel. Takes microseconds to milliseconds. |
+| **Context Switch Overhead** | Saving/restoring registers, bookkeeping. Takes 1-10 microseconds per switch. |
+
+> **💡 Key Point:** Threads per request doesn't scale. 10,000 concurrent requests = 10,000 threads = memory exhaustion.
+
+---
+
+## 🔁 Event Loop Model (Single Thread)
+
+**Key Idea:** One thread handles everything using callbacks and non-blocking IO.
+
+**How it works:**
+1. Task needs IO → registers a **callback** → gives control back to event loop.
+2. Event loop runs other tasks.
+3. When IO completes, the callback is executed.
+
+**OS Support Required:**
+- Linux: `epoll`
+- macOS: `kqueue`
+- Windows: `IOCP`
+
+**Code Example (JavaScript Callbacks - Old Style):**
+```javascript
+app.get('/users', (req, res) => {
+  // Register callback, don't block
+  db.query('SELECT * FROM users', (err, result) => {
+    if (err) return res.status(500).send(err);
+    res.json(result); // This runs when DB responds
+  });
+  // Event loop continues to other tasks here
+});
+```
+
+**Code Example (JavaScript Async/Await - Modern):**
+```javascript
+app.get('/users', async (req, res) => {
+  // await = syntactic sugar for callback
+  const result = await db.query('SELECT * FROM users');
+  res.json(result);
+});
+```
+
+**Trade-offs:**
+
+| Pros | Cons |
+| :--- | :--- |
+| No context switching | **Never block the event loop!** |
+| No multi-MB stack per task | CPU-heavy tasks freeze everything |
+| Lightweight, handles thousands of connections | Not good for CPU bound work |
+
+> **💡 Key Point:** In event loop architecture, **priority #1 is to never block the event loop**.
+
+---
+
+## 🚀 Virtual Threads & Goroutines (Go Runtime)
+
+**What is a Goroutine?** A lightweight "virtual thread" managed by the Go runtime, not the OS.
+
+**How it works:**
+1. Go runtime creates a fixed number of OS threads (default = number of CPU cores).
+2. Each OS thread has a queue of goroutines.
+3. When a goroutine blocks on IO, the Go scheduler pauses it and runs another goroutine on the same OS thread.
+
+**Code Example (Go HTTP Server):**
+```go
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    // This runs in its own goroutine (virtual thread)
+    result, err := db.Query("SELECT * FROM users")
+    if err != nil {
+        http.Error(w, err.Error(), 500)
+        return
+    }
+    json.NewEncoder(w).Encode(result)
+}
+
+// Go's HTTP package creates a new goroutine per request
+http.HandleFunc("/users", handleRequest)
+http.ListenAndServe(":8080", nil)
+```
+
+**Why Goroutines are Lightweight:**
+- Stack starts small (~2KB) and grows as needed.
+- Context switch is just a pointer change.
+- Can run millions of goroutines concurrently.
+
+---
+
+## 🔬 How Async/Await Works Under the Hood (State Machines)
+
+An `async` function is transformed by the runtime into a **state machine**.
+
+**Original Code:**
+```javascript
+async function fetchUserData(userId) {
+  const user = await db.getUser(userId);     // State 0 → State 1
+  const orders = await db.getOrders(user.id); // State 1 → State 2
+  return { user, orders };                    // State 2 → Done
+}
+```
+
+**Conceptual State Machine:**
+```javascript
+function fetchUserData(userId) {
+  let state = 0;
+  let user, orders;
+  
+  return function step() {
+    switch(state) {
+      case 0:
+        state = 1;
+        return db.getUser(userId).then(result => {
+          user = result;
+          return step();
+        });
+      case 1:
+        state = 2;
+        return db.getOrders(user.id).then(result => {
+          orders = result;
+          return step();
+        });
+      case 2:
+        return { user, orders };
+    }
+  };
+}
+```
+
+**Key Implications:**
+1. **Why `await` only works inside `async` functions:** The function must be transformed into a state machine.
+2. **Why blocking the event loop is bad:** The state machine can never transition to the next state.
+
+---
+
+## ⚠️ Race Conditions & Shared State
+
+**The Problem:** Two threads/goroutines access shared data simultaneously.
+
+**Example (Lost Update):**
+```
+Counter = 0
+
+Thread A: Read counter (0) → Add 1 (register = 1) → [PAUSED]
+Thread B: Read counter (0) → Add 1 (register = 1) → [PAUSED]
+Thread A: Write counter (1)
+Thread B: Write counter (1)
+
+Expected: 2
+Actual: 1  ← Lost Update!
+```
+
+**Race Condition in Async/Await (Even Single-Threaded!):**
+```javascript
+let balance = 100;
+
+async function withdraw(amount) {
+  // ❌ RACE CONDITION: Check and deduction are separate
+  if (balance >= amount) {
+    await processWithdrawal(amount); // Yields control here!
+    balance -= amount;
+  }
+}
+
+// Two concurrent calls
+withdraw(100); // balance: 100, passes check
+withdraw(100); // balance: 100, passes check (before first deducts)
+// Result: balance = -100 (WRONG!)
+```
+
+---
+
+## 🔒 Solutions to Race Conditions
+
+### 1. Locks / Mutexes
+```python
+import threading
+
+lock = threading.Lock()
+counter = 0
+
+def increment():
+    global counter
+    with lock:  # Only one thread can enter this block
+        counter += 1
+```
+
+### 2. Channels (Go)
+```go
+// Only one goroutine owns the counter
+func counterWorker(in <-chan int, out chan<- int) {
+    count := 0
+    for range in {
+        count++
+    }
+    out <- count
+}
+```
+
+### 3. Atomic Operations
+```javascript
+// Node.js: Use atomic operations or database transactions
+await db.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1', [amount, userId]);
+```
+
+---
+
+## 🏁 Summary & Key Takeaways
+
+### When to Use What
+
+| Workload | Best Approach | Examples |
+| :--- | :--- | :--- |
+| **IO Bound** | Concurrency (Event Loop / Async-Await / Goroutines) | Web servers, API gateways, DB-heavy apps |
+| **CPU Bound** | Parallelism (OS Threads) | Image processing, video encoding, encryption |
+
+### Mental Model
+
+| Concept | Simple Definition |
+| :--- | :--- |
+| **IO Bound** | Waiting for external resources (network, disk) |
+| **CPU Bound** | Actual computation using CPU cycles |
+| **Concurrency** | Dealing with multiple things at once (1 core can do this) |
+| **Parallelism** | Doing multiple things at once (requires 2+ cores) |
+| **Threads** | OS-managed execution units (heavy, ~8MB stack each) |
+| **Event Loop** | Single-threaded, callback-based concurrency (lightweight) |
+| **Goroutines** | Go runtime-managed virtual threads (very lightweight, ~2KB) |
+| **Async/Await** | Syntactic sugar for callbacks; async functions are state machines |
+| **Race Condition** | Two tasks access shared data simultaneously, causing wrong results |
+| **Mutex** | Lock that ensures only one task accesses shared data at a time |
+| **Channel** | Go primitive for safe communication between goroutines |
+
+### The Golden Rules
+1. **Most backend apps are IO bound** (70%+ waiting for network).
+2. **Concurrency is mandatory** for IO bound workloads.
+3. **Parallelism is beneficial** for CPU bound workloads.
+4. **Never block the event loop** in Node.js/Python asyncio.
+5. **Threads are expensive** (memory, creation, context switching).
+6. **Goroutines are cheap** (thousands/millions can run).
+7. **Always protect shared state** with locks, mutexes, or channels.
+8. **Understand the difference** between concurrency and parallelism to choose the right tools.
+
+---
+
+## 023. Object Storage - Everything You Need to Know: Part -1 (1:29:28)
 
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
