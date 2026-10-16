@@ -6903,4 +6903,5 @@ await db.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND bal
 
 ## 023. Object Storage - Everything You Need to Know: Part -1 (1:29:28)
 
+
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
