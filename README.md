@@ -6903,4 +6903,498 @@ await db.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND bal
 
 ## 023. Object Storage - Everything You Need to Know: Part -1 (1:29:28)
 
+Here is a comprehensive, simplified summary of the **Object Storage** transcript. This covers why local file storage breaks at scale, the three types of storage, how object storage works, key design, data/metadata planes, erasure coding, conditional writes, pre-signed URLs, and the two-phase upload flow—complete with practical code examples.
+
+---
+
+## 🧠 The Naive Approach (And Why It Breaks)
+
+**The Intuitive Design:**
+1. User uploads a file via `multipart/form-data`.
+2. Extract the file from the request.
+3. Save it to your server's local file system (e.g., `/uploads/profile.png`).
+4. Store the path in your database.
+
+**Why It Works Locally:** Small files (300KB–10MB), fast connection, powerful dev machine.
+
+**Why It Fails in Production:**
+
+| Problem | What Happens |
+| :--- | :--- |
+| **1. Ephemeral Disk** | Container file systems are wiped on restart/redeploy. All uploaded files are lost. |
+| **2. Horizontal Scaling** | With 3 server instances, a file uploaded to Instance 1 isn't visible to Instance 2. ~66% of requests return 404. |
+| **3. Fixed Disk Size** | Disk resizing is vertical (requires downtime) and has a hard ceiling. User files grow faster than anything else. |
+| **4. Durability** | One disk = one copy. If it dies, all user files are gone forever. |
+| **5. Serving Downloads** | Your server becomes a slow, expensive CDN. One worker is occupied for minutes transferring a 50MB file to a slow mobile client. |
+| **6. No Transactions** | Database and file system have no atomic transaction. You can end up with orphaned files or orphaned database rows. |
+
+> **💡 Key Insight:** Files are **not** JSON. They have different access patterns, different cost profiles, and require a completely different storage system: **Object Storage**.
+
+---
+
+## 📦 Three Kinds of Storage
+
+| Type | Interface | Latency | Attach To | Examples |
+| :--- | :--- | :--- | :--- | :--- |
+| **Block Storage** | Raw array of numbered blocks (512B/4KB). No files, no folders. | Microseconds | Exactly ONE machine at a time | AWS EBS, SSDs |
+| **File Storage** | POSIX semantics (open, seek, rename, lock, append). Directories, permissions. | Microseconds | Multiple machines (NFS) with trade-offs | ext4, NFS, EFS |
+| **Object Storage** | Just 4 operations: PUT, GET, DELETE, LIST. | Milliseconds–tens of ms | Any machine, globally | AWS S3, Cloudflare R2, GCS |
+
+### Object Storage Trade-offs
+
+| You Give Up (Mutability) | You Get Back (Infinite Scale) |
+| :--- | :--- |
+| ❌ Cannot modify in place (must re-upload entire object) | ✅ No coordination needed → eliminates distributed system problems |
+| ❌ No seek, no partial writes | ✅ No hierarchy to maintain/lock/rebalance |
+| ❌ No real folders (just string prefixes) | ✅ Every operation is a self-contained HTTP request |
+| ❌ No rename (copy + delete) | ✅ Any of 10,000 servers can serve any request |
+| ❌ No file locking | ✅ Infinite capacity (no provisioning/resizing) |
+| ❌ Higher latency (network round trip) | ✅ 11 nines durability, HTTP-addressable from any device |
+
+> **💡 Key Insight:** In distributed systems, **infinite scale always requires giving up mutability**. This is a recurring pattern (caching, immutable deployments, etc.).
+
+---
+
+## 🗂️ What an Object Actually Is
+
+| Component | Description |
+| :--- | :--- |
+| **Key** | A string. The **complete and entire identity** of the object. |
+| **Value** | A blob of bytes (binary data). |
+| **System Metadata** | Size, last modified, content type, ETag. |
+| **User Metadata** | Custom key-value pairs you attach (e.g., `uploaded-by: user123`). |
+
+**Buckets:** Named containers. Bucket name + key must be **globally unique** across the cloud provider.
+
+---
+
+## 🎭 Folders Are an Illusion
+
+When you see `uploads/2026/cat.png` in the AWS console, there is **no folder**. There is **one object** whose key is the entire string `"uploads/2026/cat.png"`. The slashes are just characters in a string.
+
+**How the "folder" illusion works:**
+When you request a prefix (`uploads/`) with a delimiter (`/`), the server finds all keys starting with that prefix, chops at the delimiter, and reports unique prefixes once. That's the entire folder algorithm.
+
+**Consequences:**
+- Moving a "folder" with 40,000 objects = copying 40,000 keys + deleting 40,000 keys (slow, costs money).
+- Empty folders cannot exist. To fake one, create a zero-byte object whose key ends with `/`.
+
+---
+
+## 🔑 Designing the Key (Critical Decisions)
+
+### Rule 1: Never Use the User's Filename
+**Why:**
+- **Collisions:** Two users upload `resume.pdf` → second silently overwrites first (PUT is a replace operation).
+- **Path traversal:** Filenames can contain `../`, special characters, null bytes.
+- **Encoding issues:** Emojis, RTL override characters, null bytes can break downstream systems.
+
+**Solution:** Generate a random key yourself (UUID). Store the original filename in your database or in object metadata.
+
+### Rule 2: Randomness Goes First (High Entropy)
+**Bad:** `date/hour/user/file.png` → all uploads in the same hour hit the **same index partition** → hot partition → 503 SlowDown errors.
+
+**Good:** `user-id/uuid/file.png` or `hash-prefix/...` → random data early in the key spreads across partitions.
+
+### Rule 3: Key Carries Ownership
+**Bad:** Flat namespace of UUIDs → every authorization check requires a database lookup.
+
+**Good:** `tenant-id/user-id/object-id` → authorization becomes a **string comparison** (does the key start with the user's prefix?). Can be done **before** talking to S3.
+
+**Code Example (Generating a Key in Node.js):**
+```javascript
+const crypto = require('crypto');
+
+function generateObjectKey(tenantId, userId, originalFilename) {
+  const uuid = crypto.randomUUID();
+  const ext = originalFilename.split('.').pop();
+  return `${tenantId}/${userId}/${uuid}.${ext}`;
+}
+
+// Result: "acme-corp/user-123/550e8400-e29b-41d4-a716-446655440000.png"
+```
+
+---
+
+## ⚙️ Behind the Interface: Two Planes
+
+When you PUT a 100MB file, the system splits into two independent systems:
+
+| Plane | Job | Characteristics |
+| :--- | :--- | :--- |
+| **Data Plane** | Store the actual bytes so they survive. | Huge volume, very simple operations. |
+| **Metadata Plane** | Remember that key X maps to those bytes at those locations. | Small volume, **countless operations**, must be **strongly consistent** and extremely fast (few ms). |
+
+> **💡 Key Insight:** The metadata plane is the **hard engineering problem**. Storing bytes on drives has been solved for decades. Maintaining a strongly consistent, globally distributed, sorted index over trillions of keys with millisecond latency is extraordinarily hard.
+
+### Strong vs Eventual Consistency
+- **Strongly Consistent:** After a write returns 200, any subsequent read (even 1ms later) is guaranteed to see the new data.
+- **Eventually Consistent:** There's a lag between write and when reads see it. (S3 was eventually consistent before Dec 2020; now it's strongly consistent.)
+
+---
+
+## 🧮 Erasure Coding (How Data Plane Achieves Durability Affordably)
+
+**Naive Replication:** 3 copies of every object → 200% storage overhead. Too expensive at exabyte scale.
+
+**Erasure Coding (Reed-Solomon):**
+1. Split object into **14 shards**.
+2. Compute **6 parity shards** mathematically.
+3. Total = **20 shards**, spread across 20 different drives/racks/buildings.
+4. **Any 14 of the 20** shards can reconstruct the original object.
+
+**Math:**
+- Overhead: 20/14 = **1.43x** (vs. 3x for replication).
+- Failure tolerance: **6 simultaneous failures** (vs. 2 for replication).
+- Trade-off: Extra CPU for encoding/decoding (cheaper than extra drives).
+
+### The "11 Nines" Durability Promise
+`99.999999999%` durability means: store 10 million objects → expect to lose **1 object every 10,000 years**.
+
+> **⚠️ Critical Warning:** Durability ≠ Backup. S3 will **durably, reliably, and accurately** delete your data if you run a bad `DELETE` command. It protects against drive failure, not human error.
+> - **Enable versioning** on your bucket.
+> - **Replicate to a second bucket** in a different AWS account.
+
+---
+
+## 📇 The Metadata Plane
+
+Conceptually: a **distributed B-tree** mapping `(bucket + key)` → `(shard locations + size + ETag + content type)`.
+
+**Why LIST is Slow:**
+The index is partitioned by **key range**. LIST is a **range scan** over a distributed sorted index—fundamentally more expensive than a point lookup.
+
+> **💡 The Single Most Important Rule:** **Never use LIST in your request path.** Your database is the index of what files exist. The bucket stores bytes.
+
+**Why There's No Atomic Rename:**
+Rename = changing the key in the index. But the key determines the partition. Moving a key means moving it across partitions → not atomic.
+
+**Why Object Size is Instant:**
+Size is stored in the metadata index, not computed from the drives.
+
+---
+
+## 🔒 Conditional Writes (A Game-Changer, 2024)
+
+**Before 2024:** Two processes PUT to the same key → one silently overwrites the other. No way to detect which won.
+
+**After 2024 (AWS S3):** Two headers enable compare-and-swap:
+
+| Header | Meaning |
+| :--- | :--- |
+| `If-None-Match: *` | Only create this object if the key does **NOT** already exist. Returns `412 Precondition Failed` if it does. |
+| `If-Match: <ETag>` | Only replace this object if its current ETag matches what I read. Returns `412` if someone else modified it. |
+
+**Code Example (Conditional Write via AWS CLI):**
+```bash
+# This succeeds (object doesn't exist yet)
+aws s3api put-object \
+  --bucket my-bucket \
+  --key uploads/cat.png \
+  --body cat.png \
+  --if-none-match "*"
+# → 200 OK, returns ETag
+
+# This FAILS (object already exists)
+aws s3api put-object \
+  --bucket my-bucket \
+  --key uploads/cat.png \
+  --body cat.png \
+  --if-none-match "*"
+# → 412 Precondition Failed
+```
+
+**Code Example (Conditional Write via AWS SDK for JavaScript):**
+```javascript
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const s3 = new S3Client({ region: 'us-east-1' });
+
+async function uploadIfNotExists(bucket, key, body) {
+  try {
+    await s3.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      IfNoneMatch: '*'  // Only upload if key doesn't exist
+    }));
+    return { success: true };
+  } catch (err) {
+    if (err.name === 'PreconditionFailed') {
+      return { success: false, reason: 'Object already exists' };
+    }
+    throw err;
+  }
+}
+```
+
+**Why This Matters:** Enables distributed locks, leader elections, and write-ahead logs on top of S3. For your app: **prevents duplicate-key silently destroying existing files**.
+
+> **⚠️ Disclaimer:** Not all "S3-compatible" providers support conditional writes. Check documentation (e.g., Backblaze B2 does not; Cloudflare R2 does).
+
+---
+
+## 📤 Getting the File In: Two Architectures
+
+### Architecture 1: Through Your Server (Not Recommended for Production)
+
+```
+Browser → POST /upload → Your Server → S3
+```
+
+**Problems:**
+- **Buffering:** Most frameworks read the entire file into RAM. A 100MB upload = 100MB RAM. 20 concurrent uploads = 2GB+ → OOM kill.
+- **Not visible locally:** Small files on a powerful dev machine hide the problem.
+- **Load balancer idle timeout:** ~60 seconds default; slow mobile connections hit it.
+- **Nginx body size limit:** Default 1MB → `413 Request Entity Too Large`.
+- **Serverless payload cap:** ~6MB hard limit, cannot be raised.
+
+**The Correct Implementation (Streaming):**
+Instead of reading the whole file into memory, **stream** chunks from the request body to S3 as they arrive. Memory usage stays at one small buffer (~few KB) regardless of file size.
+
+**Code Example (Streaming Upload in Go):**
+```go
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+    // Wrap body in size limit to prevent abuse
+    r.Body = http.MaxBytesReader(w, r.Body, 100<<20) // 100MB max
+    
+    // Get the file part as a reader (not loaded into memory)
+    file, _, err := r.FormFile("file")
+    if err != nil {
+        http.Error(w, err.Error(), 400)
+        return
+    }
+    defer file.Close()
+    
+    // Stream directly to S3
+    _, err = s3Client.PutObject(r.Context(), &s3.PutObjectInput{
+        Bucket: aws.String("my-bucket"),
+        Key:    aws.String("uploads/file.png"),
+        Body:   file, // Streams, doesn't buffer
+    })
+    if err != nil {
+        http.Error(w, err.Error(), 500)
+        return
+    }
+    w.WriteHeader(200)
+}
+```
+
+---
+
+### Architecture 2: Pre-Signed URLs (Production-Grade) ⭐
+
+**Core Idea:** Browser talks **directly** to S3. Bytes never touch your server.
+
+```
+Browser → GET /presign → Your Server (generates signed URL)
+Browser → PUT <signed URL> → S3 (direct upload)
+```
+
+**Pre-Signed URL Structure:**
+A normal URL with query parameters:
+- Algorithm (`AWS4-HMAC-SHA256`)
+- Access Key ID
+- Timestamp
+- Expiry (in seconds)
+- Signed headers
+- **Signature** (HMAC of method + bucket + key + expiry, hashed with your secret key)
+
+**How S3 Validates:**
+1. Rebuilds the same string from the request.
+2. Computes HMAC with its copy of the secret.
+3. Compares. If a single character of the key, method, or expiry changed → signature mismatch → `403 Forbidden`.
+
+**Code Example (Generating a Pre-Signed PUT URL in Node.js):**
+```javascript
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+const s3 = new S3Client({ region: 'us-east-1' });
+
+app.get('/presign', async (req, res) => {
+  const key = generateObjectKey(req.user.tenantId, req.user.id, req.query.filename);
+  
+  const command = new PutObjectCommand({
+    Bucket: 'my-bucket',
+    Key: key,
+    ContentType: 'image/png'
+  });
+  
+  const url = await getSignedUrl(s3, command, { expiresIn: 300 }); // 5 minutes
+  
+  res.json({ uploadUrl: url, key });
+});
+```
+
+**The Bug in Pre-Signed PUT URLs:**
+The signature covers **method, bucket, key, expiry**—but **not body size**. A user can upload a 5GB file to a URL signed for a profile picture.
+
+**The Fix: Pre-Signed POST Policies ⭐**
+
+Instead of signing a URL, sign a **JSON policy document** with conditions:
+- `content-length-range`: `[min, max]` (enforced by S3)
+- `Content-Type`: must start with `image/`
+- `key`: must start with a specific prefix (prevents escaping the user's folder)
+
+**Code Example (Pre-Signed POST with Policy in Node.js):**
+```javascript
+const { createPresignedPost } = require('@aws-sdk/s3-presigned-post');
+
+app.post('/presign-upload', async (req, res) => {
+  const key = generateObjectKey(req.user.tenantId, req.user.id, req.body.filename);
+  
+  const { url, fields } = await createPresignedPost(s3, {
+    Bucket: 'my-bucket',
+    Key: key,
+    Conditions: [
+      ['content-length-range', 1024, 5 * 1024 * 1024], // 1KB - 5MB
+      ['starts-with', '$Content-Type', 'image/'],
+      ['starts-with', '$key', `${req.user.tenantId}/${req.user.id}/`]
+    ],
+    Expires: 300 // 5 minutes
+  });
+  
+  res.json({ url, fields, key });
+});
+```
+
+**Client-Side Upload with POST Policy:**
+```javascript
+// Browser code
+const formData = new FormData();
+Object.entries(fields).forEach(([k, v]) => formData.append(k, v));
+formData.append('file', file); // File MUST be last!
+
+// Do NOT set Content-Type header on fetch (browser sets multipart boundary)
+await fetch(url, { method: 'POST', body: formData });
+```
+
+---
+
+## 🔄 The Two-Phase Flow (Telling Your Database)
+
+**Problem:** If the browser uploads directly to S3, your server never sees it. How does your database learn about the file?
+
+**Solution:**
+
+**Phase 1: Initiate (Before Upload)**
+1. Browser asks backend for an upload.
+2. Backend authorizes and **generates the key upfront**.
+3. Backend writes a database row with `status = 'pending'` and the key.
+4. Backend returns the pre-signed POST URL.
+
+**Phase 2: Complete (After Upload)**
+1. Browser finishes upload, calls `POST /upload/complete` with `uploadId` (the database row ID, NOT the key).
+2. Backend issues a **HEAD** request to S3 to verify the object exists, size is within range, content type is expected (HEAD is free).
+3. If valid, backend updates the row `status = 'completed'`.
+
+**Code Example (Two-Phase Flow):**
+```javascript
+// PHASE 1: Initiate
+app.post('/upload/initiate', authenticate, async (req, res) => {
+  const key = generateObjectKey(req.user.tenantId, req.user.id, req.body.filename);
+  
+  // Create pending DB row
+  const upload = await db.query(
+    `INSERT INTO uploads (user_id, s3_key, status, created_at) 
+     VALUES ($1, $2, 'pending', NOW()) RETURNING id`,
+    [req.user.id, key]
+  );
+  
+  // Generate pre-signed POST with policy
+  const { url, fields } = await createPresignedPost(s3, { /* ... */ });
+  
+  res.json({ uploadId: upload.rows[0].id, url, fields, key });
+});
+
+// PHASE 2: Complete
+app.post('/upload/complete', authenticate, async (req, res) => {
+  const { uploadId } = req.body;
+  
+  const upload = await db.query(
+    'SELECT s3_key FROM uploads WHERE id = $1 AND user_id = $2 AND status = $3',
+    [uploadId, req.user.id, 'pending']
+  );
+  if (!upload.rows.length) return res.status(404).json({ error: 'Upload not found' });
+  
+  // Verify with HEAD request (free, no data transfer)
+  try {
+    const head = await s3.send(new HeadObjectCommand({ Bucket: 'my-bucket', Key: upload.rows[0].s3_key }));
+    
+    // Validate size, content type, etc.
+    if (head.ContentLength > 5 * 1024 * 1024) {
+      return res.status(400).json({ error: 'File too large' });
+    }
+    
+    await db.query('UPDATE uploads SET status = $1 WHERE id = $2', ['completed', uploadId]);
+    res.json({ success: true });
+  } catch (err) {
+    if (err.name === 'NotFound') return res.status(404).json({ error: 'Object not found in S3' });
+    throw err;
+  }
+});
+```
+
+---
+
+## 🧹 Cleanup (Uploads That Never Finish)
+
+Some uploads get abandoned (tab closed, network dropped, completion API never called).
+
+**Solution:**
+1. **Bucket lifecycle rule:** Auto-delete anything under the `pending/` prefix after 24 hours.
+2. **Background job:** Periodically scan database rows with `status = 'pending'` older than 24 hours, mark as `expired`, and delete corresponding S3 objects.
+
+**Why It Matters:** Your database and bucket are two separate sources of truth. When they drift apart, cleanup jobs reconcile them.
+
+---
+
+## 🌐 CORS (For Browser Direct Uploads)
+
+When the browser uploads directly to S3, it's a cross-origin request. The bucket must have a CORS configuration:
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://myapp.com"],
+    "AllowedMethods": ["PUT", "POST"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+```
+
+> **💡 Debugging Tip:** If uploads work in `curl` but fail in the browser, check CORS first.
+
+---
+
+## 🏁 Final Summary of Key Pointers
+
+1. **Never store user files on your server's local disk** in production. Containers are ephemeral, you can't scale horizontally, and disks have hard limits.
+2. **Three storage types:** Block (raw, microsecond, one machine), File (POSIX, microsecond, NFS), Object (HTTP, milliseconds, infinite scale).
+3. **Object storage gives up mutability** (no in-place modify, no rename, no real folders, no locks) **to gain infinite scale and durability**.
+4. **An object = key (string) + value (bytes) + metadata**. The key is the entire identity.
+5. **Folders are an illusion.** Slashes are just characters in the key. "Folders" are a group-by on prefixes.
+6. **Key Design Rules:**
+   - Never use the user's filename (collisions, path traversal).
+   - Put randomness **early** in the key (avoid hot partitions).
+   - Encode ownership in the key (`tenant/user/uuid`) → string-comparison authorization.
+7. **Two planes:** Data plane (bytes, simple) and Metadata plane (index, hard, must be strongly consistent).
+8. **Erasure coding (Reed-Solomon):** 14 data + 6 parity = 20 shards, any 14 reconstruct. 1.43x overhead vs. 3x for replication. 6-failure tolerance.
+9. **11 nines durability ≠ backup.** Enable **versioning** and **cross-account replication**.
+10. **Never use LIST in the request path.** Your database is the index.
+11. **Conditional writes** (`If-None-Match: *`, `If-Match: <ETag>`) enable distributed locks and prevent silent overwrites.
+12. **Two upload architectures:**
+    - **Through your server:** Only for small files. **Must stream** to avoid OOM.
+    - **Pre-signed URLs:** Production-grade. Bytes never touch your server.
+13. **Pre-signed PUT is not enough** (no size limit). Use **pre-signed POST with policy** to enforce `content-length-range`, content type, and key prefix.
+14. **Two-phase flow:** Write a `pending` DB row → generate signed URL → client uploads → client calls completion → backend **HEADs** to verify → update to `completed`.
+15. **Cleanup:** Lifecycle rules + background job to expire abandoned `pending` uploads.
+16. **CORS:** Configure the bucket to allow your frontend origin, PUT/POST methods, and expose `ETag`.
+
+---
+
+## 024. Object Storage - Everything You Need to Know: Part -2 ()
+
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
