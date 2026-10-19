@@ -7397,4 +7397,5 @@ When the browser uploads directly to S3, it's a cross-origin request. The bucket
 
 ## 024. Object Storage - Everything You Need to Know: Part -2 ()
 
+
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
