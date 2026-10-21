@@ -7879,4 +7879,5 @@ async function downloadRange(key, start, end) {
 
 ## 025. Real-Time Backends (51:53)
 
+
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
