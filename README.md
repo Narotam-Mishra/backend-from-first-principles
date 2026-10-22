@@ -7879,5 +7879,635 @@ async function downloadRange(key, start, end) {
 
 ## 025. Real-Time Backends (51:53)
 
+Here is a comprehensive, simplified summary of the **Real-Time Systems** transcript. This covers why HTTP alone can't do realtime, polling, long polling, Server-Sent Events, WebSockets (handshake, frames, masking, ping/pong), machine limits (file descriptors, ports, memory), multi-instance state, Pub/Sub, catch-up strategies, and fan-out—complete with practical code examples.
+
+---
+
+## 🧠 The Core Problem
+
+Everything we've built so far follows **one shape**: the browser asks, the server answers.
+
+> **💡 Key Constraint:** Under plain HTTP, the **client must initiate** every conversation. The server has no mechanism to speak first.
+
+**New Requirement:** Two users are looking at the same board. User A drags a task from "To Do" to "In Progress." User B, sitting elsewhere in the world, should see the task move **live**—not on refresh, not on navigation.
+
+**Two goals for the solution:**
+1. The **server should be able to speak first**.
+2. We should pay for **actual events**, not for the number of users or requests (those are just mediums).
+
+---
+
+## 🔄 Solution 1: Polling (The Naive Approach)
+
+**How it works:** The client asks the server in a loop: *"Has anything changed since the last time I asked?"*
+
+**Example:** Every 3 seconds, the browser asks: *"Has anything changed on board #412?"* Most of the time the answer is "No."
+
+**Code Example (Polling Loop):**
+```javascript
+setInterval(async () => {
+  const res = await fetch('/api/boards/412/changes?since=' + lastChecked);
+  const data = await res.json();
+  if (data.changed) {
+    rerenderBoard(data.board);
+  }
+  lastChecked = Date.now();
+}, 3000); // Every 3 seconds
+```
+
+### Problems with Polling
+
+| Problem | Explanation |
+| :--- | :--- |
+| **Average Delay = interval / 2** | With a 3s interval, the average user waits **1.5s** to see a change. Bad UX. |
+| **Cost scales with users, not events** | 10,000 users × 1 request/3s = **3,333 req/s** forever — even when **nothing happens**. Every request hits load balancer, auth middleware, logging, database query. |
+| **Mobile battery drain** | Every poll **wakes the phone's radio** — the most expensive thing a phone does. Battery and data drain for zero changes. |
+| **Paying for the wrong thing** | You pay for requests (the medium), not for events (the value). A dead board and a busy board cost you the same. |
+
+**When polling is acceptable:** Internal tools with a handful of users. Not for a scaled user-facing product.
+
+---
+
+## 📞 Solution 2: Long Polling
+
+**The idea:** The client asks a question, and the server **holds the request open** (e.g., up to 60 seconds) instead of replying immediately. The moment something happens, the server responds and closes. The client then opens a fresh request.
+
+**Code Example (Long Polling Server in Node.js):**
+```javascript
+app.get('/api/boards/:id/wait', async (req, res) => {
+  const boardId = req.params.id;
+  let responded = false;
+
+  // Set up a listener for changes to this board
+  const onChange = (event) => {
+    if (event.boardId === boardId && !responded) {
+      responded = true;
+      clearTimeout(timeout);
+      res.json({ changed: true, event });
+    }
+  };
+  eventEmitter.on('board-change', onChange);
+
+  // Timeout: respond with "nothing" after 30 seconds
+  const timeout = setTimeout(() => {
+    if (!responded) {
+      responded = true;
+      eventEmitter.off('board-change', onChange);
+      res.json({ changed: false });
+    }
+  }, 30000);
+
+  // Clean up if client disconnects
+  req.on('close', () => eventEmitter.off('board-change', onChange));
+});
+```
+
+### The Fatal Flaw
+
+After the server responds, the client must:
+1. Process the response.
+2. **Open a new request.**
+
+During that **gap**, the server has no connection to the client. Per RFC 6202, average latency is ~1 network transit; worst case is **3+ round trips**. Changes that happen during the gap are **lost** until the next cycle.
+
+---
+
+## 📡 Solution 3: Server-Sent Events (SSE)
+
+**The idea:** Same as long polling, but the response **never ends**. The server keeps the connection open forever and writes small text events through it.
+
+**How it works:**
+1. Browser sends a normal `GET` request.
+2. Server responds `200 OK` with header `Content-Type: text/event-stream`.
+3. Server **never closes** the connection.
+4. Whenever something happens, the server writes a few bytes and flushes.
+
+**SSE Event Format (only 4 fields):**
+```
+id: 42
+event: task-moved
+data: {"taskId": "abc", "from": "todo", "to": "in-progress"}
+
+id: 43
+event: task-deleted
+data: {"taskId": "xyz"}
+
+retry: 5000
+```
+
+| Field | Purpose |
+| :--- | :--- |
+| `id` | Unique event ID. Client saves the last one; on reconnect sends `Last-Event-ID` header. |
+| `event` | Event type (`task-moved`, `task-created`, etc.). |
+| `data` | The payload (must be a string, usually JSON). |
+| `retry` | Tells the browser how long to wait before reconnecting. |
+
+**Code Example (SSE Server in Node.js):**
+```javascript
+app.get('/api/events', authenticate, (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+
+  // Catch-up: client sends Last-Event-ID on reconnect
+  const lastId = parseInt(req.headers['last-event-id'] || '0', 10);
+  const missedEvents = eventLog.filter(e => e.id > lastId);
+  for (const event of missedEvents) {
+    res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+  }
+
+  // Live events
+  const listener = (event) => {
+    res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+  };
+  eventEmitter.on('realtime-event', listener);
+
+  req.on('close', () => eventEmitter.off('realtime-event', listener));
+});
+```
+
+**Code Example (Browser SSE Client):**
+```javascript
+const source = new EventSource('/api/events');
+
+source.addEventListener('task-moved', (e) => {
+  const data = JSON.parse(e.data);
+  moveTaskCard(data.taskId, data.to);
+});
+
+// Browsers auto-reconnect and send Last-Event-ID — no code needed!
+source.onerror = () => console.log('Reconnecting...');
+```
+
+### Why SSE is Legit (Not a Toy)
+
+| Real System | Uses SSE For |
+| :--- | :--- |
+| **Uber's push platform** | Notifying drivers about trips |
+| **LinkedIn's instant messaging** | Typing indicators, read receipts |
+| **Every LLM API** | Streaming tokens (ChatGPT, Claude, etc.) |
+
+**Why:** Works over plain HTTP, works everywhere (every device speaks HTTP), browser handles reconnection natively.
+
+### The Limitation
+
+> **⚠️ SSE is ONE-WAY.** The server can talk to the client all day. The client **cannot** send messages back on the same connection. If the user drags a task, that's a separate POST request.
+
+For many products, that's fine. For a live collaborative board where the client also streams actions, you need two-way.
+
+---
+
+## 🔌 Solution 4: WebSockets (Two-Way on One Connection)
+
+### The Handshake
+
+**A WebSocket does not start as a WebSocket.** It starts as a normal HTTP GET request:
+
+```
+GET /chat HTTP/1.1
+Host: example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+```
+
+Server responds:
+
+```
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+**How `Sec-WebSocket-Accept` is computed:**
+1. Take the client's `Sec-WebSocket-Key` (16 random bytes, base64).
+2. Append the **fixed GUID** `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`.
+3. Take the **SHA-1 hash**.
+4. Base64-encode it.
+
+> **💡 Why?** It is **not** security — anyone can compute it. Its job is to prove the responder **understood the upgrade request** and isn't just a cache replaying an old `200 OK`.
+
+**Code Example (WebSocket Server in Node.js with `ws`):**
+```javascript
+const { WebSocketServer } = require('ws');
+const wss = new WebSocketServer({ port: 7821 });
+
+wss.on('connection', (ws) => {
+  console.log('Client connected');
+
+  ws.on('message', (raw) => {
+    const msg = JSON.parse(raw);
+    console.log('Received:', msg);
+
+    // Broadcast to all connected clients watching the same board
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'task-moved', ...msg }));
+      }
+    });
+  });
+
+  ws.on('close', () => console.log('Client disconnected'));
+});
+```
+
+**Code Example (Browser WebSocket Client):**
+```javascript
+const ws = new WebSocket('wss://example.com/ws?boardId=412');
+
+ws.onopen = () => console.log('Connected');
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === 'task-moved') moveTaskCard(msg.taskId, msg.to);
+};
+
+// Client can also send messages
+ws.send(JSON.stringify({ type: 'task-move', taskId: 'abc', to: 'in-progress' }));
+```
+
+---
+
+### After the Handshake: Frames
+
+Once upgraded, **HTTP is gone**. No headers, no methods, no status codes. It's a **bidirectional stream of frames**.
+
+**Frame layout (bit-level):**
+
+| Bits | Field | Meaning |
+| :--- | :--- | :--- |
+| 1 | **FIN** | Is this the last frame of the message? |
+| 3 | RSV | Reserved (for extensions) |
+| 4 | **Opcode** | 1=text, 2=binary, 8=close, 9=ping, 10=pong, 0=continuation |
+| 1 | **Mask** | Is the payload masked? (Client→server: always 1. Server→client: 0) |
+| 7 | **Payload length** | If <126: this is the length. If =126: next 2 bytes are length. If =127: next 8 bytes are length. |
+
+**The efficiency win:** A small message (under 126 bytes) has a **2-byte header**. Compare to long polling where every poll has hundreds of bytes of HTTP headers.
+
+---
+
+### The Mask Bit (A Proxy-Poisoning Defense)
+
+Every frame from **browser → server** is **masked**:
+- A random 4-byte key is generated per frame.
+- Each payload byte is XOR'd with the key (cycling through it).
+- The key is sent in **clear text** in front of the payload.
+
+**It is NOT encryption.** Anyone on the network can unmask it with one line of code.
+
+**Why does it exist?** During WebSocket design, researchers found a real attack on **caching proxies**:
+1. Malicious page opens a connection to the attacker's server.
+2. Performs a fake "HTTP upgrade."
+3. Then sends carefully crafted bytes that **look like a fresh `GET` request** for a popular file (e.g., Google Analytics script).
+4. The proxy caches that fake response.
+5. **Every user behind that proxy gets the attacker's file** when they request the real one.
+
+**How masking fixes it:** The browser XORs everything with a **fresh random key** the page's JavaScript cannot predict. The attacker can choose what they send but **cannot choose what appears on the wire**. So they cannot craft bytes that look like a valid HTTP request in the stream.
+
+> **💡 Key Point:** Masking protects the **communication arrangement**, not your data.
+
+---
+
+### Ping, Pong, and Dead Connections
+
+**The problem:** TCP connections can die **silently**:
+- User walks into a lift (elevator).
+- Phone switches from Wi-Fi to mobile data.
+- Network cable gets unplugged.
+
+**No error, no close frame, nothing.** The server's socket sees an "idle" connection. **Idle and dead look identical.**
+
+**The fix: Heartbeats.**
+- Either side sends a **Ping** (opcode 9).
+- The other side must reply with a **Pong** (opcode 10).
+- If no Pong within a timeout (~30s), the connection is considered dead and is closed, freeing resources.
+
+**Code Example (Heartbeat in Node.js `ws`):**
+```javascript
+const wss = new WebSocketServer({ port: 7821 });
+
+wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+});
+
+// Ping every 30 seconds, terminate dead connections
+const interval = setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping(); // Server → client ping
+  });
+}, 30000);
+
+wss.on('close', () => clearInterval(interval));
+```
+
+---
+
+## 📊 Machine Limits: How Many Connections Can One Server Hold?
+
+Three sequential limits hit as you scale connections:
+
+### Limit 1: File Descriptors
+
+In Unix, **everything is a file** — including a network socket. Each connection uses one file descriptor.
+
+```bash
+$ ulimit -n
+1024
+```
+
+This is the default **soft limit**. When the server tries to accept the 1,018th connection (1024 minus ~7 for stdin/stdout/stderr/listening socket/epoll), it fails with **"Too many files open."**
+
+**Language-dependent behavior:**
+
+| Language | Default FD limit |
+| :--- | :--- |
+| **Python / Node.js / Java** | ~1,024 (inherits OS soft limit) |
+| **Go** | ~1,048,575 (Go runtime raises the limit on startup) |
+
+**Why Go raises it:** The Go runtime reads that some systems set a low soft limit for legacy `select()`-based code. Go uses `epoll` instead, so it sets the limit to `max - 1` (intentionally `-1` so it can detect if someone else changes it later).
+
+```go
+// From Go's standard library (runtime/os_linux.go)
+// "Some systems set an artificially low soft limit for compatibility
+// with code that uses select... Go does not use select."
+```
+
+> **💡 Key Insight:** The famous "1000 file descriptor problem" is **real but language-dependent**. Go gives you ~1M out of the box.
+
+### Limit 2: Ports (the Client-Side Limit)
+
+With unlimited FDs, the server stopped at **28,190 connections** with error **"cannot assign requested address."**
+
+**Why?** Outgoing TCP connections need a **source port**. The kernel's ephemeral range:
+
+```bash
+$ cat /proc/sys/net/ipv4/ip_local_port_range
+32768  60999   # = 28,232 available ports
+```
+
+The test machine had 42 ports used by other services, so ~28,190 connections.
+
+**Common myth:** *"A server can only hold 65,000 connections because there are only 65,000 ports."*
+
+**Wrong.** A TCP connection is identified by a **four-tuple**:
+- Source address + Source port + Destination address + Destination port.
+
+Your server has **one** address + **one** port. So every connection to it must differ in the **source address + source port** (the client's side). This is a **client-side limitation**, not the server's.
+
+**The fix:** Give the client **multiple source addresses** to dial out from. With 3 addresses × 25,000 ports = **75,000 connections — zero failures**.
+
+> **💡 Key Insight:** For load testing, you need **multiple client machines** — the limitation is on the load generator, not the server.
+
+### Limit 3: Memory
+
+With 75,000 connections open, the server used **722 MB** of heap.
+
+**Per-connection cost:** ~**9,750 bytes** (measured 3 times: 9,751 / 9,752 / 9,881).
+
+**Extrapolation:** 1 million connections ≈ **under 10 GB of heap** (before kernel overhead). Easily fits on a 61 GB box.
+
+**But most of that 9 KB is NOT the socket.** It is:
+- The **goroutine** spawned per connection (Go's default HTTP/WS handler model).
+- The **buffers** given to it.
+
+> **💡 Optimization:** Systems that handle millions of connections **do not use a goroutine per connection**. They watch all sockets from a single place using `epoll`. This is why some WebSocket servers can handle millions on modest RAM.
+
+---
+
+## 🏢 The Multi-Instance Problem (The Big Contradiction)
+
+**Scenario:** Two server instances behind a load balancer.
+- Browser A connects → routed to **Instance 1**.
+- Browser B connects → routed to **Instance 2**.
+- User A moves a task → nothing happens in Browser B.
+
+**Why?** The WebSocket connection is **state**:
+- Instance 1 has a socket in memory, a goroutine, and a note: *"this socket watches board 412."*
+- Instance 2 has **never heard of Browser A**.
+
+> **⚠️ The Contradiction:** We spent the whole playlist making the backend **stateless** so any instance can serve any request. But a **persistent connection is state**, it lives in **one process's memory**, and it **cannot be moved or shared**.
+
+**Sticky sessions?** No. Sticky sessions route the same client back to the same instance — but Browser B is still on Instance 2 and still doesn't know about Browser A. Sticky sessions solve a **different problem** (session affinity), not this one.
+
+---
+
+## 📢 The Solution: Publish/Subscribe (Pub/Sub)
+
+**Architecture:**
+1. Instance 1 receives the "task moved" event.
+2. Instead of trying to deliver it directly, Instance 1 **publishes** it to a **topic** (e.g., `board:412`).
+3. A pub/sub broker (Redis, NATS, Kafka) delivers the event to **every instance subscribed** to that topic.
+4. Each instance looks through its **own connections**, finds those watching board 412, and writes the frame.
+
+> **💡 Key Insight:** The instance that **receives** the change and the instance that **delivers** it can be on **different machines in different countries**.
+
+**Code Example (Pub/Sub with Redis):**
+```javascript
+const Redis = require('ioredis');
+const pub = new Redis();
+const sub = new Redis();
+
+// On any instance: subscribe to board topics
+sub.psubscribe('board:*');
+sub.on('pmessage', (pattern, channel, message) => {
+  const boardId = channel.split(':')[1];
+  const event = JSON.parse(message);
+  
+  // Deliver to local connections watching this board
+  localConnections.forEach(ws => {
+    if (ws.boardId === boardId) {
+      ws.send(JSON.stringify(event));
+    }
+  });
+});
+
+// When a client moves a task, publish it
+app.post('/api/boards/:id/move', async (req, res) => {
+  const event = { type: 'task-moved', taskId: req.body.taskId, to: req.body.to };
+  
+  await db.updateTask(event.taskId, event.to);           // Persist
+  await pub.publish(`board:${req.params.id}`, JSON.stringify(event)); // Broadcast
+  
+  res.json({ success: true });
+});
+```
+
+### The Redis Pub/Sub Limitation: At-Most-Once
+
+**Redis Pub/Sub is "fire and forget."** If an instance is **not connected** at the exact moment of publish, the message is **gone forever**. No queuing, no retry.
+
+**The disaster scenario:** A deployment happens. A container goes down and its replacement comes up. In those few seconds, every message published for users on that instance is **lost**. They only see the change when they refresh.
+
+**Delivery guarantee options:**
+
+| Model | Meaning | Technologies |
+| :--- | :--- | :--- |
+| **At-most-once** | Message may be lost. Never delivered twice. | Redis Pub/Sub |
+| **At-least-once** | Message guaranteed delivered, but may be duplicated. | Redis Streams, Kafka, SQS |
+
+> **💡 Key Pointer:** If you use Redis Pub/Sub, you must **account for lost messages** with a catch-up strategy.
+
+---
+
+## 🔁 Catch-Up: Handling Missed Events
+
+**The scenario:** A connection drops (phone switches networks, laptop lid closes, load balancer idle timeout). What happens to events published while the user was disconnected?
+
+**The solution shape (same as SSE's `Last-Event-ID`):**
+
+1. **Name/ID every message** (sequence number).
+2. Client stores the **last ID it received**.
+3. On reconnect, client says: *"I have up to sequence 2. Send me everything after."*
+4. Server sends messages 3, 4, 5, ... from a **persistent log**.
+
+**How Uber does it:** Client connects → *"I'm at sequence 0"* → server streams with increasing sequence numbers → connection breaks → client reconnects → *"I got up to sequence 2"* → server resumes at 3.
+
+**Code Example (Sequence-Based Catch-Up with Redis Streams):**
+```javascript
+// Write to a stream (persistent, not fire-and-forget)
+await redis.xadd(`board:${boardId}`, '*', 'type', 'task-moved', 'data', JSON.stringify(event));
+
+// On client connect/reconnect
+app.get('/api/boards/:id/events', async (req, res) => {
+  const lastId = req.query.lastId || '0-0'; // Client's last received ID
+  
+  // Read all events after lastId
+  const events = await redis.xrange(`board:${req.params.id}`, '(' + lastId, '+');
+  
+  res.setHeader('Content-Type', 'text/event-stream');
+  for (const [id, fields] of events) {
+    res.write(`id: ${id}\ndata: ${JSON.stringify(fields)}\n\n`);
+  }
+  
+  // Then subscribe to new events live...
+});
+```
+
+> **💡 Key Insight:** This is why **Redis Streams / Kafka / SQS** matter for production realtime. They **store** messages, so catch-up is possible. Redis Pub/Sub cannot do this.
+
+---
+
+## 💥 Fan-Out and Reconnect Storms
+
+### Fan-Out (The Multiplier Problem)
+
+**The math:** Server work = **number of events × number of subscribers**.
+
+**Real measurement from Discord:** For a community with 30,000 online users, publishing **one message** took **900ms to 2.1 seconds**.
+
+**At 30,000 viewers of one board:** One person moving one task = **30,000 frame writes**.
+
+**The fix Discord found:** Don't fan out in one place. **Spread the work across machines** — each machine writes only to the recipients **it owns**.
+
+### Reconnect Storms
+
+**The scenario:** One instance holding 50,000 connections dies. All 50,000 clients reconnect **at the same moment**.
+
+**The disaster:** Each reconnecting client wants its **initial state** (which boards, which tasks, who's online) → **50,000 expensive requests in 1 second** hit your origin.
+
+**The fix (from Slack):** Make connecting **cheap** by keeping a **cache at the edge** that holds the info a client needs to start. Reconnect storms hit the edge, not the origin/core.
+
+---
+
+## 🏁 Final Summary of Key Pointers
+
+### The Progression
+
+| Technology | Direction | Mechanism | Key Limitation |
+| :--- | :--- | :--- | :--- |
+| **Polling** | Client → Server | Client asks every N seconds | Cost scales with **users**, not events. Average delay = N/2. |
+| **Long Polling** | Server → Client | Server holds request open | **Gap** between response and next request loses changes. |
+| **SSE** | Server → Client | Response never closes (`text/event-stream`) | **One-way only**. Client must use separate POST. |
+| **WebSockets** | Bidirectional | HTTP upgrade → binary frames | Persistent connection = **state** in one process. |
+
+### The Mechanics
+
+1. **WebSocket handshake:** Normal HTTP GET with `Upgrade: websocket` + `Sec-WebSocket-Key`. Server returns `101 Switching Protocols` + `Sec-WebSocket-Accept` (SHA-1 of key + fixed GUID).
+2. **Frames:** 2-byte header for small messages. Opcode: 1=text, 2=binary, 8=close, 9=ping, 10=pong, 0=continuation.
+3. **Masking:** Client→server frames are XOR'd with a random 4-byte key. **Not encryption** — protects against **proxy cache poisoning**.
+4. **Ping/Pong:** Heartbeats to detect **silently dead** TCP connections (idle and dead look identical).
+
+### The Machine Limits (in order you hit them)
+
+| Limit | Number | Fix |
+| :--- | :--- | :--- |
+| **File descriptors** | ~1,024 (Python/Node), ~1M (Go) | Raise `ulimit -n` or use Go |
+| **Ports** | ~28,000 (client-side) | Multiple client source addresses |
+| **Memory** | ~9.75 KB/connection × RAM | Use `epoll` instead of goroutine-per-connection |
+
+> **💡 Key Insight:** "65,000 connections max" is a **myth**. TCP connections are identified by a **four-tuple**. The limit is your client's source ports, not the server's.
+
+### The Architecture
+
+1. **Persistent connection = state** in one process. Cannot be shared or moved.
+2. **Sticky sessions don't solve this** — Browser B is still on a different instance.
+3. **Pub/Sub (Redis, NATS, Kafka)** lets instances broadcast events to each other.
+4. **Redis Pub/Sub = at-most-once** (fire and forget — messages lost if instance is down).
+5. **Redis Streams / Kafka / SQS = at-least-once** (stored, replayable).
+6. **Always have a catch-up strategy:** Sequence-number every message; client says "I have up to N"; server replays N+1 onward.
+7. **Fan-out cost = events × subscribers.** Spread the work across machines.
+8. **Reconnect storms:** Cache the initial state at the edge so reconnecting clients don't hit the origin.
+
+### Not Covered (But Foundational)
+
+- **Presence systems** (who's online right now).
+- **Collaborative editing** (Google Docs cursors) — requires CRDTs and conflict resolution.
+
+**Code Example (Complete Catch-Up Realtime Architecture):**
+```javascript
+// Full pattern: persistent log + live stream + catch-up
+
+app.get('/api/boards/:id/stream', authenticate, async (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+
+  const boardId = req.params.id;
+  const lastId = req.headers['last-event-id'] || '0-0';
+
+  // 1. CATCH-UP: replay missed events from persistent store
+  const missed = await redis.xrange(`board:${boardId}`, '(' + lastId, '+');
+  for (const [id, fields] of missed) {
+    res.write(`id: ${id}\ndata: ${JSON.stringify(fields)}\n\n`);
+  }
+
+  // 2. LIVE: subscribe to new events
+  const sub = redis.duplicate();
+  await sub.subscribe(`board:${boardId}`);
+  sub.on('message', (channel, message) => {
+    const { id, event } = JSON.parse(message);
+    res.write(`id: ${id}\ndata: ${JSON.stringify(event)}\n\n`);
+  });
+
+  // 3. HEARTBEAT: keep connection alive through proxies
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 15000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sub.unsubscribe();
+    sub.quit();
+  });
+});
+
+// Publishing: write to persistent stream AND notify live subscribers
+async function publishBoardEvent(boardId, event) {
+  const id = await redis.xadd(`board:${boardId}`, '*', 'event', JSON.stringify(event));
+  await redis.publish(`board:${boardId}`, JSON.stringify({ id, event }));
+}
+```
+
+---
+
+## 026. Testing for Backend Engineers: mocks, TDD and coverage (1:24:31)
+
+
 
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
