@@ -9948,5 +9948,397 @@ Some factors **aged very well** (backing services, port binding, concurrency —
 
 ## 028. OpenAPI: The universal contract between clients and servers (43:54)
 
+This transcript explains **why OpenAPI exists**, **what it is**, and **how to use it** in real projects. It's basically a full mini-course on API contracts. Below is a detailed walkthrough with all important pointers and simple code examples for each concept.
+
+---
+
+## 1. The Core Problem: Knowledge Lives in Three Places
+
+When you build an API, the knowledge about how it works lives in **three separate places**:
+
+1. **Back-end handler** (e.g., Go code that reads the JSON body)
+2. **Front-end code** (e.g., React `fetch`/Axios call that sends the request)
+3. **Documentation** (a markdown file or wiki page)
+
+These three copies **can go out of sync**.
+
+**Example of the failure:**
+- A back-end engineer renames a JSON field from `to` to `column`.
+- They update the back-end handler ✅ and the front-end ✅.
+- But they **forget the documentation** ❌.
+- Weeks later, a new engineer reads the stale doc, passes `to` instead of `column`, and gets a **400 validation error**.
+
+> **Important pointer:** Having multiple sources of truth for one API is a guaranteed bug factory.
+
+---
+
+## 2. Why This Problem Doesn't Happen Inside Your Codebase
+
+Inside one language/codebase, function signatures give you **compile-time safety**:
+
+```go
+// Go example
+func moveTask(taskID string, to string, actor string) (Event, error) {
+    // ...
+}
+```
+
+If someone changes the signature to `moveTask(taskID string, column string, actor string)`, **every caller fails to compile**. You find the break during development — not in production.
+
+**But across the network (HTTP), there is no compiler.** A REST endpoint has no signature. Breakages only appear **at runtime**.
+
+> **Key idea:** OpenAPI gives a remote HTTP call a "signature" — a contract that can be validated at development time.
+
+---
+
+## 3. What OpenAPI Is
+
+OpenAPI is a **language-agnostic, machine-readable, human-readable** description of your API — written as a single file (`openapi.json` or `openapi.yaml`).
+
+It describes:
+- All available endpoints (routes)
+- Query params, path params, headers, cookies
+- Request body fields and their types
+- Response codes, bodies, and schemas
+- Authentication mechanisms
+
+**One file → many purposes:**
+
+| Purpose | Tool Example |
+|---|---|
+| Interactive docs | Swagger UI, Scalar, Redoc |
+| Generate client SDKs | openapi-typescript, openapi-fetch |
+| Generate server interfaces | oapi-codegen (Go), FastAPI (Python) |
+| Request validation | auto-generated from schema |
+| Mock server | Prism |
+| Linting | Spectral |
+| Contract testing | Schemathesis |
+
+> **Important pointer:** The file must be **format-based (JSON/YAML)**, not plain text, so programs can parse it.
+
+---
+
+## 4. History in One Paragraph
+
+- **2010** — Wordnik (startup, ~6 engineers) needed client SDKs in many languages. **Tony Tam** created a JSON description of their API + a UI renderer. A designer named it **Swagger**.
+- **2011** — Swagger 1.0 open-sourced.
+- **2014** — Swagger 2.0; adoption grows.
+- **2015** — SmartBear buys Swagger, donates spec to the **Linux Foundation** (founding members: Google, Microsoft, IBM, PayPal…).
+- **Jan 2016** — Renamed to **OpenAPI**. Swagger 2.0 and OpenAPI 2.0 are the same thing.
+- **Today** — Current spec is **3.2.0**, but most tools still support **3.1**, so most people write 3.1.
+
+**Four terms people confuse:**
+
+| Term | Meaning |
+|---|---|
+| **OAS** (OpenAPI Specification) | The *rules* |
+| **OAD** (OpenAPI Description) | Your *file* (`openapi.yaml`) |
+| **OAI** (OpenAPI Initiative) | The *organization* maintaining the rules |
+| **Swagger** | A *tool* (UI) — or the old name of the spec |
+
+> "Swagger file" = `openapi.json`. "Swagger UI" = the rendering tool.
+
+---
+
+## 5. The Minimal OpenAPI File
+
+```yaml
+openapi: 3.1.0        # version of the SPEC
+info:
+  title: Task Board API
+  version: 1.0.0      # version of YOUR API
+paths: {}             # endpoint map (can be empty)
+```
+
+**Required fields at root:** `openapi` + `info`.  
+**At least one of:** `paths`, `components`, `webhooks`.
+
+**Optional root fields:** `servers`, `security`, `tags`.
+
+---
+
+## 6. Servers, Paths, and Dynamic Segments
+
+```yaml
+servers:
+  - url: http://localhost:8080
+  - url: https://staging.example.com
+  - url: https://api.example.com
+
+paths:
+  /api/board:
+    get: { ... }
+
+  /api/move:
+    post: { ... }
+
+  /api/tasks/{taskId}:      # {taskId} = dynamic path param
+    get: { ... }
+```
+
+- `servers` = base URL(s) — you don't repeat the host for every endpoint.
+- `paths` keys **must start with `/`**.
+- Each path item has **one entry per HTTP method** (`get`, `post`, `put`, `patch`, `delete`, `head`, `options`).
+- **Curly braces `{}`** mark dynamic path segments (e.g., task ID).
+
+---
+
+## 7. Operations, Parameters, and Request Body
+
+Every method under a path is an **operation**. Key fields:
+
+```yaml
+paths:
+  /api/move:
+    post:
+      summary: "Move a task"                 # one-liner
+      description: "Longer markdown text"    # supports markdown
+      tags: [Tasks]                          # grouping in UI
+      operationId: moveTask                  # becomes a real function name!
+      parameters:
+        - name: since
+          in: query                          # query | path | header | cookie
+          required: false
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id, to]
+              properties:
+                task_id: { type: string }
+                to:      { type: string }
+                actor:   { type: string, default: "guest" }
+      responses:
+        "200": { description: "Success", content: { application/json: { schema: { $ref: "#/components/schemas/Event" } } } }
+        "400": { description: "Validation error" }
+        "404": { description: "Task not found" }
+        "502": { description: "Message bus publish failed" }
+```
+
+**Key pointers:**
+- `operationId` → becomes the **generated function name** in clients. Write it as a function name (e.g., `moveTask`), must be **unique** in the whole file.
+- **Parameters** can live in: `query`, `path`, `header`, `cookie`. **Path params are always required** (otherwise URL becomes ambiguous).
+- **Media types** (under `content`):
+  - `application/json` — most common
+  - `multipart/form-data` — file uploads
+  - `application/x-www-form-urlencoded` — classic HTML forms
+
+---
+
+## 8. Responses and the Schema Object
+
+Responses map **status code → description + content schema**:
+
+```yaml
+responses:
+  "200":
+    description: OK
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            eventId: { type: string }
+  "404":
+    description: Task does not exist
+  "500":
+    description: Internal error
+```
+
+> Codes must be in **quotes** (`"200"`, not `200`).
+
+**The Schema Object** documents the shape of data. Data types:
+
+| Type | Extra constraints |
+|---|---|
+| `string` | `minLength`, `maxLength`, `pattern`, `enum` |
+| `number` / `integer` | `minimum`, `maximum` |
+| `boolean` | — |
+| `array` | `items` (nested schema) |
+| `object` | `properties` (string keys → any schema) |
+| `null` | — |
+
+```yaml
+# Example with enum and array
+status:
+  type: string
+  enum: [active, inactive, deleted]
+
+tags:
+  type: array
+  items:
+    type: string
+```
+
+> Schemas can be **composed** to describe virtually any data structure — this is the heart of the spec.
+
+---
+
+## 9. Code-First vs Design-First
+
+### Code-First (existing projects)
+Write the handlers first → derive the spec from annotations/comments/types.
+
+**Example (TypeScript + ts-rest + Zod):**
+
+```typescript
+import { initContract } from '@ts-rest/core';
+import { z } from 'zod';
+
+const c = initContract();
+
+export const contract = c.router({
+  moveTask: {
+    method: 'POST',
+    path: '/api/move',
+    body: z.object({
+      task_id: z.string(),
+      to: z.string(),
+      actor: z.string().optional().default('guest'),
+    }),
+    responses: {
+      200: z.object({ eventId: z.string() }),
+      400: z.object({ error: z.string() }),
+      404: z.object({ error: z.string() }),
+    },
+  },
+});
+```
+
+Then a **generator** turns this into `openapi.json`, which your Go server serves for the docs UI.
+
+**Other examples:**
+- **FastAPI (Python)** — parses handler annotations natively.
+- **Go** — libraries read struct tags/comments.
+
+### Design-First / Contract-First (new projects) ⭐ Recommended
+
+Write the spec **before** any code. The contract is the **single source of truth**.
+
+> The Swagger team started code-first, but **eventually realized contract-first is better** (their own 2013 talk says so).
+
+**Why contract-first wins:**
+- Front-end and back-end can be built **in parallel**.
+- Mocks and tests come free.
+- Works beautifully with AI agents — one agent builds server, one builds client, **neither blocks the other**.
+- Changes to the contract force compile errors in both directions.
+
+---
+
+## 10. The Design-First Pipeline (5 Stages)
+
+```
+[openapi.yaml] ──┬──> Lint (Spectral)
+                 ├──> Mock server (Prism)
+                 ├──> Client code (openapi-typescript + openapi-fetch)
+                 ├──> Server interfaces (oapi-codegen)
+                 └──> Docs UI (Swagger UI / Redoc / Scalar)
+                            │
+                            ▼
+                 Contract test (Schemathesis)
+```
+
+### Stage 1: Lint — Spectral
+Checks formatting rules.
+
+```bash
+spectral lint openapi.yaml
+```
+
+Catches: missing `description`, missing `operationId`, responses without schema, etc.
+
+### Stage 2: Mock Server — Prism
+
+```bash
+prism mock openapi.yaml
+```
+
+Responds with **examples** from your spec. Front-end team builds against the mock while the back-end team writes the real handlers.
+
+### Stage 3: Client Generation — openapi-typescript + openapi-fetch
+
+```bash
+npx openapi-typescript openapi.yaml -o api-types.ts
+```
+
+```typescript
+import createClient from 'openapi-fetch';
+import type { paths } from './api-types';
+
+const client = createClient<paths>({ baseUrl: 'http://localhost:8080' });
+
+// Fully typed — compiler catches typos and wrong types
+await client.POST('/api/move', {
+  body: { task_id: 't1', to: 'done', actor: 'alice' },
+});
+```
+
+### Stage 4: Server Interface Generation — oapi-codegen (Go)
+
+```bash
+oapi-codegen -generate types,server openapi.yaml > api.gen.go
+```
+
+Produces a Go interface your handlers **must satisfy**. If the contract adds a field, **the build fails** until you update the handler.
+
+### Stage 5: Documentation — Swagger UI / Redoc / Scalar
+
+All three read the same `openapi.yaml`. Scalar is noted as the modern, clean choice.
+
+---
+
+## 11. Testing the Server Against the File
+
+**Tool: Schemathesis** — reads the spec, generates **valid and invalid** requests, fires them at the real server, and compares actual behavior against the contract.
+
+```bash
+schemathesis run openapi.yaml --base-url http://localhost:8080
+```
+
+Also: **diff two versions of the file** to catch accidental breaking changes before merge.
+
+> **Important pointer:** The spec is only trustworthy if it's tested against the actual server. Otherwise you've rebuilt the "three truths" problem.
+
+---
+
+## 12. Real-World Proof: GitHub and Stripe
+
+Both publish their OpenAPI files publicly:
+- **GitHub**: ~344,000 lines
+- **Stripe**: ~171,000 lines
+
+Anyone integrating with them can generate typed clients directly from these files. This is what "OpenAPI is the industry standard" actually means in practice.
+
+Also relevant: **AI agents** can be handed an OpenAPI file as a tool definition and call your API correctly without any custom integration.
+
+---
+
+## 13. The Whole Thing in One Sentence
+
+> **OpenAPI is a single machine-readable file that describes every endpoint, input, output, type, and auth rule of your API — so that docs, mocks, clients, servers, and tests can all be generated from one source of truth, and remote API contracts can finally be checked at development time, not runtime.**
+
+---
+
+## Quick Cheat Sheet of Important Pointers
+
+1. **Three copies of API knowledge = three truths = guaranteed drift.** OpenAPI collapses them into one.
+2. **HTTP has no compiler.** OpenAPI is the compiler-enforced "signature" for remote calls.
+3. **`operationId` is not decoration** — it becomes the function name in generated clients. Format it like a function.
+4. **Path params are always `required: true`.**
+5. **Response codes go in quotes** (`"200"`, not `200`).
+6. **`content` maps media type → schema.** Common: `application/json`, `multipart/form-data`, `application/x-www-form-urlencoded`.
+7. **Enums, min/max, patterns, arrays-of-objects** — all expressible in the Schema Object.
+8. **Code-first** for existing projects; **design-first** for new projects. Design-first is strongly preferred.
+9. **The full design-first pipeline:** write → lint → mock → generate client → generate server → test → docs. One file drives everything.
+10. **Test the server against the file** (Schemathesis) — otherwise the contract can silently rot.
+11. **GitHub, Stripe, AI-agent tool definitions** all prove OpenAPI is the industry standard.
+12. **YAML is preferred** because JSON doesn't allow comments (and YAML is a JSON superset).
+
+---
+
+## 029. Webhooks: how the server calls you (56:06)
 
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
