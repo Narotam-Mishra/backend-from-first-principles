@@ -10341,4 +10341,611 @@ Also relevant: **AI agents** can be handed an OpenAPI file as a tool definition 
 
 ## 029. Webhooks: how the server calls you (56:06)
 
+This transcript is a deep-dive into **webhooks**: what they are, why they exist, how to receive them safely, how to send them yourself, and when *not* to use them. Below is a chapter-by-chapter summary in plain language, with all the important pointers and simple code examples for each key concept.
+
+---
+
+## Chapter 1: What a Webhook Is — The Server Calls You
+
+**Core idea:** Normally the client starts the connection and the server responds. In service-to-service communication (no browser, no human), we sometimes need the *other* backend to notify us when something happens.
+
+**Example:** You sell a paid plan via Stripe. When a payment succeeds, that success happens in **Stripe's system**, not yours. You need a reliable signal to unlock the user's plan.
+
+**Why not let the browser tell you?**
+- The user's network can fail, the tab can close, the machine can crash → **unreliable**.
+- Client-side data can be tampered with → **insecure**.
+
+**Pointer:** The signal must go **server-to-server**. Your server should be the source of truth.
+
+---
+
+## Chapter 2: Polling vs. Pushing
+
+**Brute-force solution — Polling:**
+After sending the payment request, your server calls Stripe's API every second: "Is it done yet?"
+
+**Problems with polling:**
+1. **Delay** — average delay is half the polling interval (poll every 1s → ~0.5s average delay).
+2. **Wasted requests** — every "still pending" response is wasted work.
+3. **Load / rate limits** — if 10,000 merchants poll every second, Stripe gets 10,000 req/s and will rate-limit everyone aggressively. You might be forced to poll every 60s → 30s average delay.
+
+**The solution — flip the direction:** Instead of asking repeatedly, the provider **tells you** when an event happens. This is a **webhook**.
+
+**What a webhook actually is:** A plain **HTTP POST request** that the provider sends to a **URL you expose and register** with them. It's like a **reverse API call** — they call your API.
+
+```http
+POST /hooks/stripe HTTP/1.1
+Host: your-server.com
+Content-Type: application/json
+
+{ "type": "payment_intent.succeeded", "data": { ... } }
+```
+
+---
+
+## Chapter 3: History and Terminology
+
+- **2007:** Jeff Lindsay proposed "webhooks" — a web equivalent of the Unix pipe (`cmd1 | cmd2`), where a service pushes output to another service on an event.
+- **2009:** Google engineers built **PubSubHubbub** on the same idea for blog feeds.
+
+**Key terms (every provider uses them slightly differently):**
+- **Provider / sender** — where the event actually happens (Stripe, GitHub).
+- **Consumer / receiver** — you.
+- **Endpoint** — the URL you expose that receives the POST.
+- **Event** — anything predefined (payment succeeded, task moved).
+- **Delivery** — **one attempt** to send an event to the endpoint. **One event can have many deliveries** (retries).
+- **Subscription** — your registration: "this URL, these event types."
+
+**Pointer:** Always assume an event can be delivered **multiple times**.
+
+---
+
+## Chapter 4: One Delivery End-to-End — The Receiver
+
+Typical receiver structure (three parts):
+1. **Route** — a POST route like `/hooks/github`.
+2. **Handler** — reads the raw body, verifies the signature, stores the delivery ID, responds.
+3. **Response** — a 2xx status code.
+
+**Local development problem:** Your laptop has no public address; home routers don't forward inbound requests, and `localhost` means nothing on the internet.
+
+**Solution — a tunnel:** Tools like **ngrok** or **Cloudflare Tunnel** give a local port a temporary public HTTPS URL, forwarding requests to your machine.
+
+```bash
+# Expose local port 8081 to the internet
+ngrok http 8081
+# → https://random-name.ngrok.io  forwards to localhost:8081
+```
+
+Then register that URL in GitHub → Settings → Webhooks (with a secret and event types). GitHub sends a **ping** to verify.
+
+**What GitHub records:** Each delivery's headers, payload, and your response (e.g., `202`) — visible under "Recent Deliveries."
+
+---
+
+## Chapter 5: Anatomy of a Delivery and Timeouts
+
+A typical delivery contains:
+- **POST** to your registered URL.
+- `Content-Type: application/json`.
+- `X-GitHub-Event` — the event type.
+- `X-GitHub-Delivery` — a **unique delivery ID**.
+- `X-Hub-Signature-256` — the signature (security).
+- **Body** — full event data as JSON.
+
+**How the provider knows it succeeded:** The **HTTP status code**. Any **2xx** = success (`200`, `202` both fine). Anything else (3xx, 4xx) = failure.
+
+**Timeouts (you must respond fast):**
+| Provider | Timeout |
+|---|---|
+| GitHub | 10 seconds |
+| Shopify | 5 seconds |
+| Slack | 3 seconds |
+| Microsoft Graph | 3 seconds |
+
+**Pointer:** Check each provider's docs for its timeout. Missing the deadline = a failure = a retry.
+
+**Registration form usually has:** URL, secret, list of event types.
+
+**Pointer:** Use **separate URLs per provider** (`/hooks/github`, `/hooks/stripe`) — never a generic `/hooks/callback`. Each provider has its own headers, signature style, and retry mechanism.
+
+---
+
+## Chapter 6: Handshakes and Tunnels
+
+Some providers add a **handshake** before sending real events:
+- **Microsoft Graph** — expects a validation token returned in plain text.
+- **Discord** — sends a `ping`, expects a `pong`.
+- **Amazon SNS** — sends a subscription confirmation URL you must visit.
+
+**Why?** Without a handshake, an attacker could register a **victim's URL** and flood it with events as a **DDoS attack**.
+
+```python
+# Microsoft Graph validation handshake (Flask example)
+@app.route("/hooks/graph", methods=["POST"])
+def graph_webhook():
+    token = request.args.get("validationToken")
+    if token:
+        return token, 200, {"Content-Type": "text/plain"}  # echo it back
+    # ... normal event handling
+```
+
+**Tunnels for local dev:** As in Chapter 4 — ngrok/Cloudflare give you a temporary public HTTPS URL that forwards to your laptop.
+
+---
+
+## Chapter 7: Trusting a Delivery — The Threat
+
+**The problem:** Your endpoint is **public**. Anyone who guesses the URL (`/webhooks`, `/hooks`, `/callback` are common patterns) can POST fake JSON saying "payment succeeded for user 123" and unlock paid plans for free.
+
+**HTTPS does NOT solve this.** HTTPS protects data **in transit** (nobody can read/intercept the bytes), but it does **not** prove **who sent** the request. You need a mechanism to prove the event came from your provider.
+
+---
+
+## Chapter 8: Five Ways to Prove It — and HMAC
+
+| # | Method | Notes |
+|---|---|---|
+| 1 | **Secret token in URL** | Weakest — URLs get logged everywhere (CloudWatch, Elasticsearch), so the token leaks. |
+| 2 | **IP allowlist** | Provider publishes its IPs; you firewall everything else. Better, but incomplete alone. |
+| 3 | **Mutual TLS** | Provider gives you a client certificate; you require it. |
+| 4 | **HMAC signature** | **Most common (65–80% of providers).** Signature over the body using a shared secret. |
+| 5 | **Signature with public key** | Provider signs with private key; you verify with public key (e.g., Discord). |
+
+**HMAC = Hash-based Message Authentication Code.**
+
+**How it works:**
+1. Provider computes `HMAC-SHA256(secret, body)` and puts the result in a header.
+2. You compute the **same** HMAC over the **same body** with the **same secret**.
+3. Compare. If they match → it came from the provider.
+
+**Why hashing works:** Any change to even one byte of input completely changes the fixed-length fingerprint.
+
+**Pointer:** *What* gets signed differs per provider — always check the docs:
+- **GitHub** — signs only the body.
+- **Stripe** — signs `timestamp + "." + body` (timestamp adds replay protection).
+- **Standard Webhooks** — signs `delivery_id + "." + timestamp + "." + body`.
+- **Twilio** — signs the full URL + sorted form fields (SHA-1).
+
+```python
+import hmac, hashlib
+
+def compute_hmac(secret: bytes, body: bytes) -> str:
+    return hmac.new(secret, body, hashlib.sha256).hexdigest()
+
+# Stripe-style: sign "timestamp.body"
+signed_payload = f"{timestamp}.{body}".encode()
+signature = compute_hmac(secret, signed_payload)
+```
+
+---
+
+## Chapter 9: What Exactly Is Signed — and the Raw-Body Trap
+
+**The trap:** The signature is computed over the **exact bytes**. If you parse JSON and re-encode it, whitespace/ordering changes → **different bytes → different HMAC → verification fails**.
+
+Example: provider writes `{"a":1,"b":2}` (no spaces); your framework re-encodes to `{"a": 1, "b": 2}` (with spaces). The HMAC no longer matches.
+
+**The golden rule:**
+1. Read the body as **raw bytes**.
+2. **Verify** the signature over those bytes.
+3. **Then** parse the JSON.
+
+```python
+# WRONG — parse first, then re-encode
+data = json.loads(request.data)
+body = json.dumps(data).encode()          # bytes changed!
+verify(request.headers["X-Sig"], body)    # will fail
+
+# RIGHT — verify raw bytes, then parse
+raw = request.get_data()                  # raw bytes
+verify(request.headers["X-Sig"], raw)     # verify first
+data = json.loads(raw)                    # parse after
+```
+
+**Failure modes demoed:**
+- Correct secret, correct raw bytes → `202` success.
+- Wrong secret → `401` (signature mismatch).
+- Parse-then-re-encode instead of verify-first → verification fails even with the right secret.
+
+---
+
+## Chapter 10: Replays and Constant-Time Comparison
+
+**Replay attack:** An attacker captures a **real** delivery (headers + body) via MITM and re-sends it later, or 1,000 times. Since the signature is genuine, it verifies → the attacker triggers your side effects repeatedly.
+
+**Defense 1 — Timestamps:** Providers include a timestamp **inside the signed string**, so it can't be altered without breaking the signature. Reject anything older than a window (Stripe: **5 minutes**).
+
+**Defense 2 — Constant-time comparison:** Ordinary string equality (`==`) stops at the **first mismatched byte**, leaking timing information. Over many requests, an attacker could derive the signature byte-by-byte.
+
+**Use the constant-time function your language provides:**
+- **Go** — `hmac.Equal`
+- **Node.js** — `crypto.timingSafeEqual`
+- **Python** — `hmac.compare_digest`
+
+```python
+import hmac
+
+# WRONG — early exit on first mismatch (timing leak)
+if computed == received:
+    ...
+
+# RIGHT — always takes the same time
+if hmac.compare_digest(computed, received):
+    ...
+```
+
+```javascript
+// Node.js
+const crypto = require("crypto");
+
+// WRONG
+if (computed === received) { ... }
+
+// RIGHT — buffers must be the same length
+if (crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(received))) {
+  // valid
+}
+```
+
+---
+
+## Chapter 11: SSRF — The Provider's Own Danger
+
+**Server-Side Request Forgery (SSRF):** The provider calls **whatever URL the customer typed** in the registration form — **from the provider's own network**.
+
+**The attack:** Register `http://169.254.169.254/...` (the cloud **metadata service** on many clouds, which can leak credentials or internal admin hostnames). The provider's dispatcher then POSTs there → the attacker weaponizes the provider's network.
+
+**Why registration-time URL checks aren't enough:**
+- A domain can resolve to a public IP at registration time and a **private IP later** (DNS rebinding).
+- A public URL can **redirect** (`301`/`302`) to a private address.
+
+**Correct defenses (on the sending side):**
+1. **Resolve the hostname yourself** at send time and check the IP against a fixed list of **private ranges**.
+2. **Never follow redirects** — treat any non-2xx as failure.
+3. Send from a **separate egress network** (an egress proxy). Stripe open-sourced **Smokescreen** for this.
+
+```python
+import ipaddress, socket
+
+PRIVATE_NETS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local / metadata
+]
+
+def is_safe_url(hostname: str) -> bool:
+    ip = socket.gethostbyname(hostname)      # resolve yourself
+    addr = ipaddress.ip_address(ip)
+    return not any(addr in net for net in PRIVATE_NETS)
+
+# On the sending side: resolve + check every send; never follow redirects.
+```
+
+---
+
+## Chapter 12: At Least Once — Idempotency and Ordering
+
+**The "at least once" promise:** Your `200` acknowledgement can get **lost in the network** (connection dropped, load balancer restarted). The provider sees a failure → **retries with the same payload**.
+
+So events will **never be exactly once** — they arrive **at least once**, possibly many times.
+
+**Solution — Idempotency:** The same event processed N times must have the **effect of once**.
+
+**Use the delivery ID** (unique per event, identical across retries):
+- GitHub — header `X-GitHub-Delivery`
+- Stripe — body field `event.id`
+- Standard Webhooks — `webhook-id`
+
+**Store processed delivery IDs with a UNIQUE constraint**, and — critically — **insert that row in the SAME transaction as your actual work**.
+
+**Why same transaction?**
+- Work first, ID second → crash between them → retry finds no ID → **duplicate work**.
+- ID first, work second → work fails → retry sees the ID → **skips needed work**.
+- **Both in one transaction** → either both happen or neither.
+
+```sql
+-- Processed-deliveries table
+CREATE TABLE processed_deliveries (
+  delivery_id TEXT PRIMARY KEY,   -- UNIQUE constraint
+  processed_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+```python
+# Idempotent handler (pseudo-code)
+def handle_event(delivery_id, event):
+    with db.transaction():
+        # 1) Claim the delivery — fails if already processed
+        db.execute(
+            "INSERT INTO processed_deliveries (delivery_id) VALUES (%s)",
+            (delivery_id,)
+        )
+        # 2) Do the actual side effect in the SAME transaction
+        db.execute("UPDATE users SET plan = 'paid' WHERE id = %s", (event.user_id,))
+    # Both commit together, or neither does.
+```
+
+**Ordering problem (Stripe, 2017):** Retries reorder events. "created" fails and retries in 5 min; "deleted" succeeds immediately → you receive **deleted first**, then created → you end up with a row for an object that no longer exists.
+
+**Pointer:** Stripe docs: *"Events are not delivered in order."* Timestamps are in **seconds**, so events under 1 second apart share a timestamp.
+
+**Solutions:**
+1. **Treat the event as a signal only** — on receipt, **fetch the current state** from the provider's API and act on that. Order becomes irrelevant (costs one API call).
+2. **Version / `updated_at` field** — apply the event only if newer than what you have, in one transaction.
+3. **Buffer events** per object until earlier events arrive (unpredictable; some providers sell **strict ordering** as a paid feature).
+
+```python
+# Solution 1: signal → fetch current state
+def on_payment_event(event):
+    # Don't trust the payload's state; fetch the truth
+    current = stripe.PaymentIntent.retrieve(event.data.object.id)
+    if current.status == "succeeded":
+        unlock_plan(current.customer)
+```
+
+```python
+# Solution 2: apply only if newer
+def apply_event(event):
+    row = db.get_object(event.object_id)
+    if row and event.updated_at <= row.updated_at:
+        return                     # stale — ignore
+    db.upsert_object(event.object_id, event.data, event.updated_at)
+```
+
+---
+
+## Chapter 13: Retries, Backoff, and the Clock Against the Load
+
+When your endpoint fails or times out, the provider **retries** — with its **own schedule** (check each provider's docs):
+
+| Provider | Retry behavior |
+|---|---|
+| **Stripe** | Exponential backoff, retries up to **3 days**, then **disables the endpoint** and emails you. |
+| **Svix** | Immediate, then 5s, 5m, 30m, 2h, 5h, 10h, … |
+| **GitHub** | **Zero retries.** A missed delivery is gone — redeliver manually or via API. |
+| Shopify / Slack / Polar | Each different. |
+
+**The load spiral:** Tight timeouts (10s/5s/3s) + retries = **extra load on top of your normal user traffic**. Burst traffic is common:
+- Billing renews **all subscriptions on the 1st of the month**.
+- A marketing tool sends 500k emails → 500k delivery receipts.
+
+If your handler does all the work **inside** the request (verify → update 3 tables → call other APIs → respond), it will miss the deadline → retry → more load.
+
+**The right architecture — a thin receiver + a queue + a worker:**
+
+```
+Receiver (thin):                    Background worker:
+1. Read raw body                    1. Pull from queue
+2. Verify signature                 2. Do ALL the work
+3. Insert delivery attempt (DB)     3. Retry on failure
+4. Return 2xx immediately
+5. STOP
+```
+
+```python
+# Thin receiver
+@app.route("/hooks/stripe", methods=["POST"])
+def stripe_webhook():
+    raw = request.get_data()
+    verify_stripe_signature(raw, request.headers)   # 1–2
+    db.insert("inbox", delivery_id=..., payload=raw)  # 3
+    queue.publish("webhooks", delivery_id)           # enqueue
+    return "", 202                                   # 4 — fast ack
+```
+
+```python
+# Background worker (separate process)
+def worker():
+    for delivery_id in queue.consume("webhooks"):
+        event = db.get("inbox", delivery_id)
+        process_event(event)   # all real work here
+```
+
+**Pointer:** Ideally one **queue per endpoint/customer** so one dead customer URL doesn't stall everyone else.
+
+---
+
+## Chapter 14: Building Your Own — The Outbox Pattern
+
+Now **you** are the provider (e.g., your task board emits `task.moved` and customers register URLs).
+
+**Naive version:** In the move handler, after saving, call `http.Post(customer_url)`.
+
+**Three problems:**
+1. **Latency** — a slow/down customer URL becomes **your** latency; your frontend waits.
+2. **Lost event** — DB write succeeds, then your server crashes before POST → event never sent.
+3. **False signal** — POST succeeds, then your DB write fails → you told the customer something that **didn't happen**.
+
+**The Outbox pattern:** An **outbox table in the same database** as your business data.
+
+**How it works:**
+1. The move handler starts a transaction: update the task **and** insert the full event into the `outbox` table — **same transaction**.
+2. Commit. Either both happen or neither.
+3. A **separate background dispatcher** reads the outbox and does the delivery **asynchronously**.
+
+This is the **write-ahead log** idea applied to events: write your intent durably first, let another process do the delivery. Your handler no longer takes on the customer's latency.
+
+```python
+# Move handler — atomic task update + outbox insert
+def move_task(task_id, to_status, actor):
+    with db.transaction():
+        db.execute(
+            "UPDATE tasks SET status = %s WHERE id = %s",
+            (to_status, task_id)
+        )
+        db.execute(
+            "INSERT INTO outbox (event_type, payload) VALUES (%s, %s)",
+            ("task.moved", json.dumps({
+                "task_id": task_id,
+                "to": to_status,
+                "actor": actor,
+                "seq": next_sequence(),
+                "at": now_iso(),
+            }))
+        )
+    # Both commit together — no lost events, no false signals.
+```
+
+Tables used: **endpoints** (URL + secret), **outbox** (pending events), **deliveries** (one row per attempt).
+
+---
+
+## Chapter 15: The Dispatcher — Sign, POST, Record, Retry
+
+**Per delivery, the dispatcher:**
+1. **Sign** `delivery_id + "." + timestamp + "." + body` (Standard Webhooks format) with the **endpoint's secret**.
+2. **POST** with a **timeout** (10s is a common default — derive from your own promises).
+3. **Record** the attempt: status code, **first 2 KB of the response**, time.
+4. **Decide:**
+   - **2xx** → mark **delivered**, no retry.
+   - **Anything else** → schedule next retry with **exponential backoff + jitter**.
+   - After the **last attempt** → mark **exhausted**.
+   - After **10 consecutive failures** → **disable the endpoint**, email the owner.
+5. **Security guard** — resolve the URL **at every send** (not just registration) and refuse private addresses.
+
+**Exponential backoff:** Grow the delay each attempt (5s → 5m → 15m → 1h).
+
+**Jitter:** Add randomness so 1,000 retries don't all fire at the same 5-minute mark — spread them out (5m01s, 5m35s, …).
+
+**Respect `Retry-After`:** If the receiver sends this header ("I'm having issues, retry after 1h"), honor it over your own schedule.
+
+```python
+import random
+
+def next_retry_delay(attempt: int) -> int:
+    base = min(5 * (2 ** attempt), 6 * 3600)   # exponential, capped
+    jitter = random.randint(0, 60)              # spread out
+    return base + jitter
+
+def dispatch(outbox_row):
+    endpoint = db.get_endpoint(outbox_row.endpoint_id)
+    url = endpoint.url
+
+    # Security guard on EVERY send
+    if not is_safe_url(urlparse(url).hostname):
+        record_attempt(outbox_row, status="blocked")
+        return
+
+    ts = int(time.time())
+    signed = f"{outbox_row.id}.{ts}.{outbox_row.payload}".encode()
+    sig = hmac.new(endpoint.secret.encode(), signed, hashlib.sha256).hexdigest()
+
+    try:
+        resp = requests.post(
+            url,
+            data=outbox_row.payload,
+            headers={"Webhook-Signature": f"t={ts},v1={sig}"},
+            timeout=10,
+            allow_redirects=False,     # never follow redirects
+        )
+    except requests.Timeout:
+        resp = None
+
+    record_attempt(outbox_row, status=resp.status_code if resp else "timeout",
+                   response_prefix=resp.text[:2048] if resp else "")
+
+    if resp and 200 <= resp.status_code < 300:
+        mark_delivered(outbox_row)
+    else:
+        delay = next_retry_delay(outbox_row.attempts)
+        if resp and "Retry-After" in resp.headers:
+            delay = max(delay, int(resp.headers["Retry-After"]))
+        schedule_retry(outbox_row, delay)
+```
+
+**Demo results:** Customer returns `500` → attempt recorded → next attempt time computed → delays grow due to backoff+jitter. Fix the customer → next attempt gets `200` → delivered, no more retries. Registering a loopback/private URL → refused with a reason, checked **at send time** so DNS rebinding is also caught.
+
+---
+
+## Chapter 16: When a Webhook Is the Wrong Tool — Syncing
+
+**Webhooks are notifications** — "this happened, here's the data." They are the **right** tool for:
+- Posting an event to a chat channel.
+- Triggering a CI/CD build (GitHub Actions).
+- Unlocking a plan after payment.
+
+**They are the wrong tool for syncing** — keeping a **copy** of the provider's data in your database.
+
+**The Clerk example:** Clerk is an auth provider; your roles/permissions live in Clerk. Calling Clerk's API on every check costs **500–600 ms** vs **50–60 ms** for your local DB. So people copy Clerk's data locally and sync it via webhooks.
+
+**Why that's painful:** You inherit **every** webhook edge case — timeouts, retries, **replays**, and especially **ordering** (events arrive in any order). Keeping a valid copy this way is very hard.
+
+**Pointer:** The idea of keeping a copy is fine. The problem is using **raw webhook deliveries** as the sync mechanism.
+
+---
+
+## Chapter 17: The Event Log — The Right Way to Sync
+
+**Key insight:** Providers keep their **own event log** (API/UI), and **it is guaranteed to be ordered** — because it's written inside their own infrastructure, not across distributed network calls.
+
+**Strategy 1 — Periodic pull (when minutes of staleness is OK):**
+Every 5 minutes, a background worker fetches events from the provider's `/events` API, applies inserts/updates/deletes, and stores the **last processed event ID** so the next run continues from there (no redundant work).
+
+```python
+def sync_worker():
+    last_id = db.get_state("last_event_id")
+    events = provider.get_events(after=last_id)     # ordered log
+    for e in events:
+        apply_to_local_copy(e)                       # insert/update/delete
+        db.set_state("last_event_id", e.id)          # checkpoint
+```
+
+**Strategy 2 — Webhook as a trigger, event log as the source (near-real-time):**
+Subscribe to a "new event was added to the log" webhook. On receipt, a background process pulls from your **last event ID** forward through the **ordered** log and applies changes.
+
+- The webhook is only a **signal** — it carries no state, so replays/order don't matter.
+- The **ordered event log** gives you correctness.
+- Your copy syncs within seconds, and you're **not abusing webhooks**.
+
+```python
+@app.route("/hooks/clerk", methods=["POST"])
+def clerk_webhook():
+    verify_signature(request)                # authenticate
+    queue.publish("sync", "new_event")       # just a signal
+    return "", 202
+
+def sync_worker():
+    last_id = db.get_state("last_event_id")
+    events = clerk.get_events(after=last_id)  # ordered
+    for e in events:
+        apply_to_local_copy(e)
+        db.set_state("last_event_id", e.id)
+```
+
+---
+
+## Master Pointer Checklist
+
+**Receiving:**
+- ✅ Read **raw bytes** → verify signature → **then** parse.
+- ✅ Use **constant-time comparison** (`hmac.compare_digest`, `crypto.timingSafeEqual`, `hmac.Equal`).
+- ✅ Enforce a **timestamp window** (e.g., 5 min) to stop replays.
+- ✅ Know **what your provider signs** (body only? timestamp+body? id+timestamp+body?).
+- ✅ Respond **2xx within the provider's timeout** (10s/5s/3s).
+- ✅ **Thin receiver**: verify → store → enqueue → 2xx. Do the work in a **background worker**.
+- ✅ **Idempotency**: unique delivery ID + work in the **same transaction**.
+- ✅ Handle **out-of-order** events (fetch current state, or version/`updated_at`).
+- ✅ **Separate URL/handler per provider**.
+- ✅ Support **handshakes** where required.
+- ✅ Use a **tunnel** (ngrok/Cloudflare) for local dev.
+
+**Sending (you as provider):**
+- ✅ **Outbox** table, written in the **same transaction** as the business change.
+- ✅ Async **dispatcher** with signing, timeout, attempt recording, exponential backoff + **jitter**, `Retry-After` support, exhaustion + endpoint disable after N failures.
+- ✅ **One queue per endpoint** to isolate bad customers.
+- ✅ **SSRF guard at every send**: resolve yourself, block private ranges, **never follow redirects**, use an egress proxy.
+- ✅ Sign with a scheme your customers can verify (Standard Webhooks format: `id.timestamp.body`).
+
+**Architecture:**
+- ✅ Webhooks = **notifications**, not sync.
+- ✅ For sync, use the provider's **ordered event log** (periodic pull or webhook-as-trigger + pull from last event ID).
+- ✅ Never trust the browser for critical signals; the **server is the source of truth**.
+
+---
+
+## 030. DevOps for backend engineers (1:48:25)
+
 summaries this backend tutorial transcript in simple words with all detail, make note of all important pointers and also explain each important concepts with basic code examples
